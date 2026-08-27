@@ -346,6 +346,7 @@ export class AutonomousAgentEngine {
 
         let validationPassed = true;
         let validationErrorMsg = '';
+        let failedFileResults: Array<{ path: string; valid: boolean; errors: string[] }> = [];
 
         try {
           const valRes = await fetch('/api/workspace/validate', {
@@ -370,8 +371,8 @@ export class AutonomousAgentEngine {
             });
             validationPassed = valData.allValid;
             if (!valData.allValid) {
-              const failedFiles = valData.results?.filter((r: any) => !r.valid) || [];
-              validationErrorMsg = failedFiles.map((f: any) => `${f.path}: ${f.errors.join('; ')}`).join(' | ');
+              failedFileResults = (valData.results?.filter((r: any) => !r.valid) || []) as Array<{ path: string; valid: boolean; errors: string[] }>;
+              validationErrorMsg = failedFileResults.map((f) => `${f.path}: ${f.errors.join('; ')}`).join(' | ');
             }
           }
         } catch (vErr) {
@@ -379,11 +380,120 @@ export class AutonomousAgentEngine {
           console.warn('Validation endpoint issue:', vErr);
         }
 
+        // Autonomous Self-Correction & Auto-Repair Loop (up to 3 bounded repair attempts)
+        if (!validationPassed && failedFileResults.length > 0) {
+          const maxRepairAttempts = 3;
+          for (let attempt = 1; attempt <= maxRepairAttempts; attempt++) {
+            if (signal.aborted) throw new Error('Aborted by user');
+
+            runState.status = 'self_correcting';
+            callbacks.onStateChange({ ...runState });
+            addThought(
+              'Self-Correction',
+              `Compiler diagnostic flagged issues (${validationErrorMsg}). Executing autonomous auto-repair attempt ${attempt}/${maxRepairAttempts}...`,
+              'action'
+            );
+
+            callbacks.onLog({
+              id: `log-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
+              timestamp: Date.now(),
+              level: 'agent',
+              source: 'repair_engine',
+              message: `[AUTO-REPAIR] Initiating self-healing cycle ${attempt}/${maxRepairAttempts} for ${failedFileResults.length} broken files...`,
+            });
+
+            for (const brokenFile of failedFileResults) {
+              const fileInTask = filesChangedInTask.find((f) => f.path === brokenFile.path);
+              if (!fileInTask) continue;
+
+              try {
+                const repairRes = await fetch('/api/agent/repair-step', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    filePath: brokenFile.path,
+                    currentContent: fileInTask.content,
+                    errors: brokenFile.errors,
+                    taskTitle: taskDef.title,
+                    taskDescription: taskDef.description,
+                    goal,
+                  }),
+                  signal,
+                });
+
+                if (repairRes.ok) {
+                  const repairData = await repairRes.json();
+                  if (repairData.repaired && repairData.content) {
+                    fileInTask.content = repairData.content;
+                    fileInTask.lastModified = Date.now();
+
+                    // Update working files
+                    const wIdx = workingFiles.findIndex((f) => f.path === brokenFile.path);
+                    if (wIdx >= 0) workingFiles[wIdx] = { ...fileInTask };
+
+                    // Update task snapshot
+                    const snapIdx = taskRollbackSnapshots.findIndex((s) => s.path === brokenFile.path);
+                    if (snapIdx >= 0) {
+                      taskRollbackSnapshots[snapIdx].newContent = repairData.content;
+                    }
+
+                    callbacks.onFileUpdate({ ...fileInTask });
+                    addThought('Repaired File', `Applied auto-repair patch to ${brokenFile.path}`, 'action');
+                  }
+                }
+              } catch (repairErr) {
+                if (signal.aborted) throw new Error('Aborted by user');
+                console.warn('Repair attempt failed:', repairErr);
+              }
+            }
+
+            // Re-validate the repaired files with esbuild
+            try {
+              const revalRes = await fetch('/api/workspace/validate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  files: filesChangedInTask.map((f) => ({ path: f.path, content: f.content })),
+                }),
+                signal,
+              });
+
+              if (revalRes.ok) {
+                const revalData = await revalRes.json();
+                validationPassed = revalData.allValid;
+                if (revalData.allValid) {
+                  failedFileResults = [];
+                  validationErrorMsg = '';
+                  addThought(
+                    'Repair Succeeded',
+                    `✓ Autonomous self-correction resolved all compiler errors on attempt ${attempt}.`,
+                    'verification'
+                  );
+                  callbacks.onLog({
+                    id: `log-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
+                    timestamp: Date.now(),
+                    level: 'success',
+                    source: 'repair_engine',
+                    message: `[AUTO-REPAIR] ✓ Self-correction cycle ${attempt} passed all syntax and compiler checks cleanly.`,
+                  });
+                  break;
+                } else {
+                  failedFileResults = (revalData.results?.filter((r: any) => !r.valid) || []) as Array<{ path: string; valid: boolean; errors: string[] }>;
+                  validationErrorMsg = failedFileResults.map((f) => `${f.path}: ${f.errors.join('; ')}`).join(' | ');
+                }
+              }
+            } catch (revalErr) {
+              if (signal.aborted) throw new Error('Aborted by user');
+              console.warn('Revalidation error:', revalErr);
+            }
+          }
+        }
+
         if (!validationPassed) {
           newTaskItem.status = 'failed';
-          newTaskItem.validationError = validationErrorMsg || 'Cross-file compilation failed.';
+          newTaskItem.validationError = validationErrorMsg || 'Cross-file compilation failed after self-correction attempts.';
           callbacks.onTaskUpdate(newTaskItem);
-          addThought('Validation Failed', `Errors detected: ${validationErrorMsg}`, 'observation');
+          addThought('Validation Failed', `Errors persisted after auto-repair attempts: ${validationErrorMsg}`, 'observation');
           throw new Error(`Validation failed: ${validationErrorMsg}`);
         }
 
