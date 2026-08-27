@@ -42,6 +42,32 @@ function sanitizeAgentContext(context: any): any {
   const allowed = {
     purpose: typeof context.purpose === 'string' ? context.purpose.slice(0, 2000) : '',
     framework: typeof context.framework === 'string' ? context.framework.slice(0, 200) : '',
+    instruction: typeof context.instruction === 'string' ? context.instruction.slice(0, 4000) : '',
+    plan: context.plan && typeof context.plan === 'object' ? {
+      summary: typeof context.plan.summary === 'string' ? context.plan.summary.slice(0, 2000) : '',
+      estimatedSteps: Number.isInteger(context.plan.estimatedSteps) ? context.plan.estimatedSteps : 0,
+      tasks: Array.isArray(context.plan.tasks) ? context.plan.tasks.slice(0, 50).map((task: any) => ({
+        title: typeof task.title === 'string' ? task.title.slice(0, 500) : '',
+        description: typeof task.description === 'string' ? task.description.slice(0, 2000) : '',
+        priority: typeof task.priority === 'string' ? task.priority.slice(0, 30) : '',
+        targetFiles: Array.isArray(task.targetFiles) ? task.targetFiles.filter((item: any) => typeof item === 'string').slice(0, 100) : [],
+        subtasks: Array.isArray(task.subtasks) ? task.subtasks.filter((item: any) => typeof item === 'string').slice(0, 50) : [],
+      })) : [],
+      reasoning: Array.isArray(context.plan.reasoning) ? context.plan.reasoning.filter((item: any) => typeof item === 'string').slice(0, 50) : [],
+    } : undefined,
+    lifecycleStatus: typeof context.lifecycleStatus === 'string' ? context.lifecycleStatus.slice(0, 40) : '',
+    completedSteps: Array.isArray(context.completedSteps) ? context.completedSteps.filter((item: any) => typeof item === 'string').slice(-100) : [],
+    pendingSteps: Array.isArray(context.pendingSteps) ? context.pendingSteps.filter((item: any) => typeof item === 'string').slice(-100) : [],
+    affectedFiles: Array.isArray(context.affectedFiles) ? context.affectedFiles.filter((item: any) => typeof item === 'string').slice(-200) : [],
+    rollback: context.rollback && typeof context.rollback === 'object' ? {
+      checkpointId: typeof context.rollback.checkpointId === 'string' ? context.rollback.checkpointId.slice(0, 120) : '',
+      fileCount: Number.isInteger(context.rollback.fileCount) ? context.rollback.fileCount : 0,
+      integrity: context.rollback.integrity === true,
+    } : undefined,
+    lastValidation: context.lastValidation && typeof context.lastValidation === 'object' ? sanitizeResult(context.lastValidation) : undefined,
+    lastBuild: context.lastBuild && typeof context.lastBuild === 'object' ? sanitizeResult(context.lastBuild) : undefined,
+    resumeEligible: context.resumeEligible === true,
+    updatedAt: typeof context.updatedAt === 'number' ? context.updatedAt : Date.now(),
     architecture: Array.isArray(context.architecture) ? context.architecture.filter((item: any) => typeof item === 'string').slice(-20) : [],
     importantFiles: Array.isArray(context.importantFiles) ? context.importantFiles.filter((item: any) => typeof item === 'string').slice(-100) : [],
     latestWorkingState: typeof context.latestWorkingState === 'string' ? context.latestWorkingState.slice(0, 2000) : '',
@@ -58,9 +84,21 @@ function sanitizeAgentContext(context: any): any {
       stepIndex: Number.isInteger(context.checkpoint.stepIndex) ? context.checkpoint.stepIndex : 0,
       status: typeof context.checkpoint.status === 'string' ? context.checkpoint.status.slice(0, 40) : '',
       updatedAt: typeof context.checkpoint.updatedAt === 'number' ? context.checkpoint.updatedAt : Date.now(),
+      integrity: context.checkpoint.integrity === true,
     } : undefined,
   };
   return allowed;
+}
+
+function sanitizeResult(result: any): Record<string, unknown> {
+  if (!result || typeof result !== 'object') return {};
+  return {
+    status: typeof result.status === 'string' ? result.status.slice(0, 40) : '',
+    exitCode: typeof result.exitCode === 'number' ? result.exitCode : undefined,
+    command: typeof result.command === 'string' ? result.command.slice(0, 200) : '',
+    durationMs: typeof result.durationMs === 'number' ? result.durationMs : undefined,
+    timestamp: typeof result.timestamp === 'number' ? result.timestamp : Date.now(),
+  };
 }
 
 function sanitizeWorkspaceForPersistence(ws: any): any {
@@ -215,11 +253,40 @@ app.post('/api/workspaces/:id/agent-context', (req: Request, res: Response) => {
     res.status(404).json({ success: false, error: 'Workspace not found.' });
     return;
   }
-  workspace.agentContext = sanitizeAgentContext(req.body?.context);
+  workspace.agentContext = sanitizeAgentContext({
+    ...(workspace.agentContext || {}),
+    ...(req.body?.context || {}),
+  });
   workspace.updatedAt = Date.now();
   writePersistedWorkspaces(store);
   res.json({ success: true, context: workspace.agentContext });
 });
+
+function recoverIncompleteAgentTasks(): void {
+  const activeStatuses = new Set(['queued', 'planning', 'inspecting', 'synthesizing', 'writing_code', 'running_tests', 'validating', 'building', 'self_correcting', 'reviewing', 'committing', 'pushing', 'verifying']);
+  const store = readPersistedWorkspaces();
+  let changed = false;
+  for (const workspace of store.workspaces) {
+    const context = workspace.agentContext;
+    if (!context || !activeStatuses.has(context.lifecycleStatus)) continue;
+    const workspaceRoot = getWorkspaceRoot(workspace.id);
+    const checkpoint = context.checkpoint;
+    const validCheckpoint = checkpoint && checkpoint.integrity === true && Number.isInteger(checkpoint.stepIndex);
+    const workspaceExists = fs.existsSync(workspaceRoot) && fs.statSync(workspaceRoot).isDirectory();
+    workspace.agentContext = sanitizeAgentContext({
+      ...context,
+      lifecycleStatus: 'blocked',
+      latestWorkingState: 'blocked',
+      currentBlocker: workspaceExists && validCheckpoint
+        ? 'Backend restarted; task paused at its last verified checkpoint.'
+        : 'Backend restarted and the previous checkpoint could not be verified safely.',
+      resumeEligible: workspaceExists && validCheckpoint,
+      updatedAt: Date.now(),
+    });
+    changed = true;
+  }
+  if (changed) writePersistedWorkspaces(store);
+}
 
 app.post('/api/workspaces', (req: Request, res: Response) => {
   const { workspaces, workspace, activeProjectId } = req.body;
@@ -2048,6 +2115,7 @@ app.post('/api/workspace/run-tests', async (req: Request, res: Response) => {
 
 // Vite middleware for development & static files in production
 async function startServer() {
+  recoverIncompleteAgentTasks();
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },

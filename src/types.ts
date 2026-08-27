@@ -196,7 +196,18 @@ export interface ProjectConfig {
     currentBlocker?: string;
     lastSuccessfulBuild?: number;
     recentTaskHistory?: { title: string; status: string; timestamp: number }[];
-    checkpoint?: { taskId: string; phase: string; stepIndex: number; status: string; updatedAt: number };
+    checkpoint?: { taskId: string; phase: string; stepIndex: number; status: string; updatedAt: number; integrity?: boolean };
+    instruction?: string;
+    plan?: { summary: string; estimatedSteps: number; tasks: unknown[]; reasoning: string[] };
+    lifecycleStatus?: string;
+    completedSteps?: string[];
+    pendingSteps?: string[];
+    affectedFiles?: string[];
+    rollback?: { checkpointId: string; fileCount: number; integrity: boolean };
+    lastValidation?: { status: string; exitCode?: number; command: string; durationMs?: number; timestamp: number };
+    lastBuild?: { status: string; exitCode?: number; command: string; durationMs?: number; timestamp: number };
+    resumeEligible?: boolean;
+    updatedAt?: number;
   };
 }
 

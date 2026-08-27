@@ -51,12 +51,26 @@ export class AutonomousAgentEngine {
   }
 
   private async persistAgentContext(project: ProjectConfig, state: AgentRunState): Promise<void> {
+    const completedSteps = project.tasks.filter((task) => task.status === 'completed').map((task) => task.title);
+    const pendingSteps = project.tasks.filter((task) => task.status !== 'completed').map((task) => task.title);
     const context = {
       purpose: project.description,
       framework: project.framework,
+      instruction: state.currentGoal,
       importantFiles: project.files.map((file) => file.path),
       latestWorkingState: state.status,
       currentBlocker: state.error || '',
+      lifecycleStatus: state.status,
+      completedSteps,
+      pendingSteps,
+      affectedFiles: project.tasks.flatMap((task) => task.modifiedFiles?.map((file) => file.path) || []),
+      rollback: {
+        checkpointId: `checkpoint-${project.id}`,
+        fileCount: project.files.length,
+        integrity: true,
+      },
+      resumeEligible: ['aborted', 'blocked'].includes(state.status),
+      updatedAt: Date.now(),
       lastSuccessfulBuild: state.status === 'completed' ? Date.now() : project.agentContext?.lastSuccessfulBuild,
       recentTaskHistory: project.tasks.slice(0, 20).map((task) => ({
         title: task.title,
@@ -69,6 +83,7 @@ export class AutonomousAgentEngine {
         stepIndex: state.currentStepIndex,
         status: state.status,
         updatedAt: Date.now(),
+        integrity: true,
       },
     };
     await fetch(`/api/workspaces/${encodeURIComponent(project.id)}/agent-context`, {
@@ -604,8 +619,8 @@ button, input { font: inherit; }
       const contextRes = await fetch(`/api/workspaces/${encodeURIComponent(project.id)}/agent-context`);
       if (contextRes.ok) {
         const contextData = await contextRes.json();
-        resumeFromStep = contextData.context?.checkpoint?.status === 'aborted'
-          ? Math.max(0, Number(contextData.context.checkpoint.stepIndex) - 1)
+        resumeFromStep = contextData.context?.resumeEligible && contextData.context?.checkpoint?.integrity
+          ? Math.max(0, Number(contextData.context.checkpoint.stepIndex))
           : 0;
       }
     } catch {
@@ -616,7 +631,7 @@ button, input { font: inherit; }
       onStateChange: (newState) => {
         this.state = newState;
         this.notifyListeners();
-        this.persistAgentContext(currentProj, newState);
+        void this.persistAgentContext(currentProj, newState);
       },
       onLog: (log) => {
         onLog(log.message, log.level, log.source);
@@ -628,7 +643,7 @@ button, input { font: inherit; }
           : [...currentProj.files, updatedFile];
         currentProj = { ...currentProj, files: newFiles, updatedAt: Date.now() };
         onProjectUpdate(currentProj);
-        this.persistAgentContext(currentProj, this.state);
+        void this.persistAgentContext(currentProj, this.state);
       },
       onTaskUpdate: (updatedTask) => {
         const taskExists = currentProj.tasks.some((t) => t.id === updatedTask.id);
@@ -637,7 +652,7 @@ button, input { font: inherit; }
           : [updatedTask, ...currentProj.tasks];
         currentProj = { ...currentProj, tasks: newTasks, updatedAt: Date.now() };
         onProjectUpdate(currentProj);
-        this.persistAgentContext(currentProj, this.state);
+        void this.persistAgentContext(currentProj, this.state);
       },
       onTestUpdate: (updatedTest) => {
         const newTests = currentProj.tests.map((t) =>
