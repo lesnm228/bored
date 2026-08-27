@@ -1,0 +1,25 @@
+{
+  "name": "KC Builder Board",
+  "short_name": "KC Board",
+  "description": "KC Builder Board workspace for planning, building, and validating projects.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "theme_color": "#0b1730",
+  "background_color": "#0b1730",
+  "icons": [
+    {
+      "src": "/icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-maskable.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ]
+}
