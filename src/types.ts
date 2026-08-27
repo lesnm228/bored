@@ -122,6 +122,29 @@ export interface LogEntry {
 
 export type BuildLogEntry = LogEntry;
 
+export type TerminalSessionStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+
+export interface TerminalEvent {
+  type: 'stdout' | 'stderr' | 'system' | 'exit';
+  text: string;
+  timestamp: number;
+  exitCode?: number | null;
+  status?: TerminalSessionStatus;
+}
+
+export interface TerminalSession {
+  id: string;
+  projectId: string;
+  command: string;
+  workingDirectory: string;
+  status: TerminalSessionStatus;
+  startedAt: number;
+  finishedAt?: number;
+  durationMs?: number;
+  exitCode?: number | null;
+  events: TerminalEvent[];
+}
+
 export interface ProjectConfig {
   id: string;
   name: string;
@@ -141,6 +164,7 @@ export interface ProjectConfig {
   tests: TestCase[];
   deployments: DeploymentRecord[];
   history: HistoryEvent[];
+  terminalSessions?: TerminalSession[];
   envVariables: {
     key: string;
     value: string;

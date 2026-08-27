@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   WorkspaceView,
   ProjectConfig,
@@ -8,11 +8,13 @@ import {
   TaskStatus,
   ProjectFile,
   AutonomyLevel,
+  TerminalSession,
 } from './types';
 import { initialProjects, defaultSettings } from './data/initialData';
 import { ProjectService } from './services/projectService';
 import { globalAgentEngine } from './services/agentEngine';
 import { exportProjectZip, exportProjectJson, exportAuditTrail } from './services/exportService';
+import { TerminalService } from './services/terminalService';
 
 // Component views
 import { LandingPage } from './components/LandingPage';
@@ -43,6 +45,9 @@ export default function App() {
   const [logs, setLogs] = useState<BuildLogEntry[]>([]);
   const [logsOpen, setLogsOpen] = useState(false);
   const [agentState, setAgentState] = useState(globalAgentEngine.getState());
+  const [activeTerminalSession, setActiveTerminalSession] = useState<TerminalSession | null>(null);
+  const [isExecutingCommand, setIsExecutingCommand] = useState(false);
+  const activeCancelRef = useRef<(() => Promise<boolean>) | null>(null);
 
   // Save to persistent storage when state changes
   useEffect(() => {
@@ -517,6 +522,54 @@ export default function App() {
     }
   };
 
+  // Terminal Command Execution
+  const handleExecuteTerminalCommand = async (commandStr: string) => {
+    if (!commandStr.trim() || isExecutingCommand) return;
+    setLogsOpen(true);
+    setIsExecutingCommand(true);
+    appendLog(`$ ${commandStr}`, 'agent', 'TERMINAL');
+
+    try {
+      const { session, cancel } = await TerminalService.executeCommand({
+        projectId: currentProject.id,
+        command: commandStr,
+        files: currentProject.files,
+        onEvent: (event) => {
+          appendLog(
+            event.text,
+            event.type === 'stderr' ? 'error' : event.type === 'exit' ? (event.exitCode === 0 ? 'success' : 'error') : 'info',
+            'TERMINAL'
+          );
+        },
+        onFinished: (finishedSession) => {
+          setActiveTerminalSession(finishedSession);
+          setIsExecutingCommand(false);
+          activeCancelRef.current = null;
+          const existing = currentProject.terminalSessions || [];
+          const updated = [finishedSession, ...existing.filter((s) => s.id !== finishedSession.id)].slice(0, 30);
+          handleUpdateProject({ ...currentProject, terminalSessions: updated });
+        },
+      });
+
+      setActiveTerminalSession(session);
+      activeCancelRef.current = cancel;
+    } catch (err: any) {
+      setIsExecutingCommand(false);
+      activeCancelRef.current = null;
+      appendLog(`Command execution failed: ${err.message}`, 'error', 'TERMINAL');
+    }
+  };
+
+  const handleCancelTerminalCommand = async () => {
+    if (activeCancelRef.current) {
+      appendLog('Cancelling active command execution...', 'warn', 'TERMINAL');
+      await activeCancelRef.current();
+    } else if (activeTerminalSession) {
+      await TerminalService.cancelExecution(activeTerminalSession.id);
+    }
+    setIsExecutingCommand(false);
+  };
+
   // Render Landing Page if selected
   if (currentView === 'landing') {
     return (
@@ -681,6 +734,10 @@ export default function App() {
         logs={logs}
         onToggle={() => setLogsOpen(!logsOpen)}
         onClear={() => setLogs([])}
+        activeSession={activeTerminalSession}
+        isExecuting={isExecutingCommand}
+        onExecuteCommand={handleExecuteTerminalCommand}
+        onCancelCommand={handleCancelTerminalCommand}
       />
     </div>
   );

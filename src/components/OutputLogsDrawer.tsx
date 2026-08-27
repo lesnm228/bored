@@ -13,14 +13,21 @@ import {
   AlertCircle,
   Clock,
   Sparkles,
+  Play,
+  Square,
+  CornerDownLeft,
 } from 'lucide-react';
-import { BuildLogEntry } from '../types';
+import { BuildLogEntry, TerminalSession } from '../types';
 
 interface OutputLogsDrawerProps {
   isOpen: boolean;
   logs: BuildLogEntry[];
   onToggle: () => void;
   onClear: () => void;
+  activeSession?: TerminalSession | null;
+  isExecuting?: boolean;
+  onExecuteCommand?: (command: string) => void;
+  onCancelCommand?: () => void;
 }
 
 export const OutputLogsDrawer: React.FC<OutputLogsDrawerProps> = ({
@@ -28,10 +35,15 @@ export const OutputLogsDrawer: React.FC<OutputLogsDrawerProps> = ({
   logs,
   onToggle,
   onClear,
+  activeSession,
+  isExecuting,
+  onExecuteCommand,
+  onCancelCommand,
 }) => {
   const [filterLevel, setFilterLevel] = useState<string>('all');
   const [search, setSearch] = useState('');
   const [autoScroll, setAutoScroll] = useState(true);
+  const [commandInput, setCommandInput] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -59,6 +71,13 @@ export const OutputLogsDrawer: React.FC<OutputLogsDrawerProps> = ({
     URL.revokeObjectURL(url);
   };
 
+  const handleSubmitCommand = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!commandInput.trim() || isExecuting) return;
+    onExecuteCommand?.(commandInput.trim());
+    setCommandInput('');
+  };
+
   const getLevelColor = (level: string) => {
     switch (level) {
       case 'error':
@@ -74,10 +93,18 @@ export const OutputLogsDrawer: React.FC<OutputLogsDrawerProps> = ({
     }
   };
 
+  const quickCommands = [
+    { label: 'npm test', cmd: 'npm test' },
+    { label: 'npm run build', cmd: 'npm run build' },
+    { label: 'npm run lint', cmd: 'npm run lint' },
+    { label: 'npm run typecheck', cmd: 'npm run typecheck' },
+    { label: 'git status', cmd: 'git status' },
+  ];
+
   return (
     <div
       className={`border-t border-blue-900/40 bg-[#020617] transition-all duration-300 flex flex-col z-40 ${
-        isOpen ? 'h-72 sm:h-80' : 'h-8'
+        isOpen ? 'h-80 sm:h-96' : 'h-8'
       }`}
     >
       {/* Header Bar */}
@@ -93,6 +120,34 @@ export const OutputLogsDrawer: React.FC<OutputLogsDrawerProps> = ({
           <span className="text-[10px] px-1.5 py-0.2 rounded bg-blue-900/30 text-blue-300 font-mono border border-blue-500/20">
             {logs.length} lines
           </span>
+
+          {activeSession && (
+            <span
+              className={`text-[10px] px-2 py-0.5 rounded-full font-mono font-semibold flex items-center gap-1 border ${
+                activeSession.status === 'running'
+                  ? 'bg-amber-950/60 border-amber-500/50 text-amber-400 animate-pulse'
+                  : activeSession.status === 'completed'
+                  ? 'bg-emerald-950/60 border-emerald-500/50 text-emerald-400'
+                  : activeSession.status === 'failed'
+                  ? 'bg-red-950/60 border-red-500/50 text-red-400'
+                  : 'bg-slate-900/80 border-slate-700 text-slate-400'
+              }`}
+            >
+              <span
+                className={`w-1.5 h-1.5 rounded-full ${
+                  activeSession.status === 'running'
+                    ? 'bg-amber-400'
+                    : activeSession.status === 'completed'
+                    ? 'bg-emerald-400'
+                    : 'bg-red-400'
+                }`}
+              />
+              <span>
+                {activeSession.status.toUpperCase()} ({activeSession.command})
+                {activeSession.durationMs ? ` in ${activeSession.durationMs}ms` : ''}
+              </span>
+            </span>
+          )}
         </div>
 
         <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
@@ -156,11 +211,27 @@ export const OutputLogsDrawer: React.FC<OutputLogsDrawerProps> = ({
 
       {/* Terminal Body */}
       {isOpen && (
-        <div className="flex-1 flex flex-col overflow-hidden p-3 font-mono text-xs text-slate-300 bg-[#030816]">
-          <div className="flex-1 overflow-y-auto space-y-1 pr-2 select-text">
+        <div className="flex-1 flex flex-col overflow-hidden bg-[#030816]">
+          {/* Quick Action Command Chips */}
+          <div className="px-3 py-1.5 bg-[#080d1a] border-b border-blue-900/30 flex items-center gap-2 overflow-x-auto text-[11px] font-mono">
+            <span className="text-slate-500 text-[10px] uppercase tracking-wider shrink-0">Quick Commands:</span>
+            {quickCommands.map((qc) => (
+              <button
+                key={qc.cmd}
+                disabled={isExecuting}
+                onClick={() => onExecuteCommand?.(qc.cmd)}
+                className="px-2 py-0.5 rounded bg-[#0a101f] hover:bg-blue-900/40 border border-blue-900/50 hover:border-amber-500/50 text-slate-300 hover:text-amber-300 text-[10px] transition-colors shrink-0 disabled:opacity-40"
+              >
+                {qc.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Logs scroll area */}
+          <div className="flex-1 overflow-y-auto space-y-1 p-3 font-mono text-xs text-slate-300 pr-2 select-text">
             {filteredLogs.length === 0 ? (
               <div className="text-slate-600 text-center py-8 text-xs">
-                No logs matching filter. Terminal ready.
+                No logs matching filter. Interactive development terminal ready.
               </div>
             ) : (
               filteredLogs.map((log) => (
@@ -183,14 +254,52 @@ export const OutputLogsDrawer: React.FC<OutputLogsDrawerProps> = ({
                       [{log.source}]
                     </span>
                   )}
-                  <span className="text-slate-200 break-all font-sans text-xs">{log.message}</span>
+                  <span className="text-slate-200 break-all font-mono text-xs">{log.message}</span>
                 </div>
               ))
             )}
             <div ref={bottomRef} />
           </div>
+
+          {/* Real Command Input Bar */}
+          <form
+            onSubmit={handleSubmitCommand}
+            className="p-2 border-t border-blue-900/40 bg-[#0a101f] flex items-center gap-2"
+          >
+            <span className="text-amber-400 font-mono text-xs font-bold pl-1">$</span>
+            <input
+              type="text"
+              value={commandInput}
+              onChange={(e) => setCommandInput(e.target.value)}
+              placeholder="Execute command (e.g. npm test, npm run build, tsc --noEmit)..."
+              disabled={isExecuting}
+              className="flex-1 bg-[#030816] border border-blue-900/60 rounded-lg px-3 py-1.5 text-xs text-slate-100 font-mono placeholder-slate-600 focus:outline-none focus:border-amber-500 disabled:opacity-50"
+            />
+
+            {isExecuting ? (
+              <button
+                type="button"
+                onClick={onCancelCommand}
+                className="px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-500 text-white font-bold text-xs flex items-center gap-1.5 transition-colors shadow-sm active:scale-95 animate-pulse"
+                title="Cancel running command"
+              >
+                <Square className="w-3 h-3 fill-white" />
+                <span>Cancel</span>
+              </button>
+            ) : (
+              <button
+                type="submit"
+                disabled={!commandInput.trim()}
+                className="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-slate-950 font-bold text-xs flex items-center gap-1 transition-colors active:scale-95"
+              >
+                <span>Run</span>
+                <CornerDownLeft className="w-3 h-3" />
+              </button>
+            )}
+          </form>
         </div>
       )}
     </div>
   );
 };
+

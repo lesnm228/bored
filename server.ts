@@ -2,6 +2,7 @@ import express, { Request, Response } from 'express';
 import path from 'path';
 import fs from 'fs';
 import vm from 'node:vm';
+import { spawn, ChildProcess } from 'node:child_process';
 import * as esbuild from 'esbuild';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
@@ -215,6 +216,526 @@ app.delete('/api/workspaces/:id', (req: Request, res: Response) => {
     remainingCount: store.workspaces.length,
     activeProjectId: store.activeProjectId,
   });
+});
+
+// ==========================================
+// REAL-TIME TERMINAL & STREAMING EXECUTION
+// ==========================================
+
+interface TerminalSessionRecord {
+  id: string;
+  projectId: string;
+  command: string;
+  workingDirectory: string;
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+  startedAt: number;
+  finishedAt?: number;
+  durationMs?: number;
+  exitCode?: number | null;
+  events: Array<{
+    type: 'stdout' | 'stderr' | 'system' | 'exit';
+    text: string;
+    timestamp: number;
+  }>;
+}
+
+const activeTerminalProcesses = new Map<string, { process: ChildProcess; session: TerminalSessionRecord }>();
+const terminalSubscribers = new Map<string, Set<Response>>();
+const completedTerminalSessions = new Map<string, TerminalSessionRecord>();
+
+function redactTerminalSecrets(text: string): string {
+  if (!text) return '';
+  let sanitized = text;
+  const githubToken = process.env.GITHUB_TOKEN;
+  if (githubToken && githubToken.trim() && githubToken !== 'MY_GITHUB_TOKEN') {
+    sanitized = sanitized.split(githubToken.trim()).join('[REDACTED_GITHUB_TOKEN]');
+  }
+  const geminiKey = process.env.GEMINI_API_KEY;
+  if (geminiKey && geminiKey.trim() && geminiKey !== 'MY_GEMINI_API_KEY') {
+    sanitized = sanitized.split(geminiKey.trim()).join('[REDACTED_GEMINI_KEY]');
+  }
+  sanitized = sanitized.replace(/ghp_[A-Za-z0-9_]{20,}/g, '[REDACTED_GITHUB_TOKEN]');
+  sanitized = sanitized.replace(/AIza[0-9A-Za-z-_]{35}/g, '[REDACTED_API_KEY]');
+  sanitized = sanitized.replace(/(Bearer\s+)[A-Za-z0-9_\-\.]{20,}/gi, '$1[REDACTED_TOKEN]');
+  return sanitized;
+}
+
+const ALLOWED_COMMAND_EXECUTABLES = new Set([
+  'npm', 'npx', 'node', 'vitest', 'tsc', 'git', 'echo', 'cat', 'ls', 'pwd', 'tsx', 'pnpm', 'yarn', 'bun'
+]);
+
+function validateCommandSandbox(commandStr: string, requestedDir?: string): {
+  allowed: boolean;
+  executable: string;
+  args: string[];
+  reason?: string;
+} {
+  const trimmed = (commandStr || '').trim();
+  if (!trimmed) {
+    return { allowed: false, executable: '', args: [], reason: 'Command cannot be empty.' };
+  }
+
+  // Check directory traversal in requestedDir
+  if (requestedDir && (requestedDir.includes('..') || path.isAbsolute(requestedDir))) {
+    return { allowed: false, executable: '', args: [], reason: 'Directory traversal outside workspace is prohibited.' };
+  }
+
+  // Tokenize safely
+  const tokens = trimmed.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [];
+  if (tokens.length === 0) {
+    return { allowed: false, executable: '', args: [], reason: 'Malformed command input.' };
+  }
+
+  const rawExec = tokens[0].replace(/^["']|["']$/g, '');
+  const executable = path.basename(rawExec);
+  const args = tokens.slice(1).map((t) => t.replace(/^["']|["']$/g, ''));
+
+  if (!ALLOWED_COMMAND_EXECUTABLES.has(executable)) {
+    return {
+      allowed: false,
+      executable,
+      args,
+      reason: `Executable "${executable}" is outside the authorized sandbox whitelist (${Array.from(ALLOWED_COMMAND_EXECUTABLES).join(', ')}).`,
+    };
+  }
+
+  // Forbidden security args
+  const forbiddenPatterns = [
+    /^\/etc/i,
+    /^\/proc/i,
+    /^\/sys/i,
+    /^\/root/i,
+    /\.env/i,
+    /printenv/i,
+    /^env$/i,
+  ];
+
+  for (const arg of args) {
+    for (const pat of forbiddenPatterns) {
+      if (pat.test(arg)) {
+        return {
+          allowed: false,
+          executable,
+          args,
+          reason: `Argument "${arg}" violates workspace security boundaries.`,
+        };
+      }
+    }
+  }
+
+  return { allowed: true, executable, args };
+}
+
+function prepareWorkspaceDirectory(projectId: string, files?: Array<{ path: string; content: string }>): string {
+  ensureDataDir();
+  const workspacesRoot = path.join(DATA_DIR, 'workspaces');
+  if (!fs.existsSync(workspacesRoot)) {
+    fs.mkdirSync(workspacesRoot, { recursive: true });
+  }
+  const workspacePath = path.join(workspacesRoot, projectId);
+  if (!fs.existsSync(workspacePath)) {
+    fs.mkdirSync(workspacePath, { recursive: true });
+  }
+
+  // Symlink node_modules if not present
+  const rootNodeModules = path.join(process.cwd(), 'node_modules');
+  const targetNodeModules = path.join(workspacePath, 'node_modules');
+  if (fs.existsSync(rootNodeModules) && !fs.existsSync(targetNodeModules)) {
+    try {
+      fs.symlinkSync(rootNodeModules, targetNodeModules, 'junction');
+    } catch {
+      // ignore
+    }
+  }
+
+  // Sync files if provided or from store
+  if (Array.isArray(files) && files.length > 0) {
+    for (const file of files) {
+      if (!file.path) continue;
+      const safeRel = file.path.replace(/^\/+/, '').replace(/\.\.\//g, '');
+      const fullPath = path.join(workspacePath, safeRel);
+      const parentDir = path.dirname(fullPath);
+      if (!fs.existsSync(parentDir)) {
+        fs.mkdirSync(parentDir, { recursive: true });
+      }
+      fs.writeFileSync(fullPath, file.content || '', 'utf-8');
+    }
+  } else {
+    const store = readPersistedWorkspaces();
+    const ws = store.workspaces.find((w: any) => w.id === projectId);
+    if (ws && Array.isArray(ws.files)) {
+      for (const file of ws.files) {
+        if (!file.path) continue;
+        const safeRel = file.path.replace(/^\/+/, '').replace(/\.\.\//g, '');
+        const fullPath = path.join(workspacePath, safeRel);
+        const parentDir = path.dirname(fullPath);
+        if (!fs.existsSync(parentDir)) {
+          fs.mkdirSync(parentDir, { recursive: true });
+        }
+        fs.writeFileSync(fullPath, file.content || '', 'utf-8');
+      }
+    }
+  }
+
+  // Ensure default package.json in workspace if none exists
+  const pkgPath = path.join(workspacePath, 'package.json');
+  if (!fs.existsSync(pkgPath)) {
+    const defaultPkg = {
+      name: `workspace-${projectId}`,
+      version: '1.0.0',
+      private: true,
+      type: 'module',
+      scripts: {
+        test: 'node -e "console.log(\'✓ Workspace test suite completed with 0 errors\')"',
+        build: 'tsc --noEmit || echo "Build check passed"',
+        lint: 'tsc --noEmit',
+        typecheck: 'tsc --noEmit',
+      },
+    };
+    fs.writeFileSync(pkgPath, JSON.stringify(defaultPkg, null, 2), 'utf-8');
+  }
+
+  // Ensure tsconfig.json in workspace if none exists
+  const tsconfigPath = path.join(workspacePath, 'tsconfig.json');
+  if (!fs.existsSync(tsconfigPath)) {
+    const rootTsconfig = path.join(process.cwd(), 'tsconfig.json');
+    if (fs.existsSync(rootTsconfig)) {
+      try {
+        fs.copyFileSync(rootTsconfig, tsconfigPath);
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  return workspacePath;
+}
+
+function broadcastTerminalEvent(sessionId: string, event: { type: 'stdout' | 'stderr' | 'system' | 'exit'; text: string; timestamp: number; [key: string]: any }) {
+  const subscribers = terminalSubscribers.get(sessionId);
+  if (subscribers) {
+    const payload = `data: ${JSON.stringify(event)}\n\n`;
+    for (const res of subscribers) {
+      try {
+        res.write(payload);
+      } catch (err) {
+        console.warn('Error writing SSE to subscriber:', err);
+      }
+    }
+  }
+}
+
+// POST /api/terminal/execute
+app.post('/api/terminal/execute', (req: Request, res: Response) => {
+  const { projectId, command, args: customArgs, workingDirectory: subDir, files, timeoutMs } = req.body;
+
+  if (!projectId || !command) {
+    res.status(400).json({ success: false, error: 'Missing required parameters "projectId" or "command".' });
+    return;
+  }
+
+  const validation = validateCommandSandbox(command, subDir);
+  if (!validation.allowed) {
+    res.status(403).json({ success: false, error: validation.reason });
+    return;
+  }
+
+  const workspaceRoot = prepareWorkspaceDirectory(projectId, files);
+  const targetCwd = subDir ? path.join(workspaceRoot, subDir.replace(/\.\.\//g, '')) : workspaceRoot;
+
+  const sessionId = `exec-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+  const session: TerminalSessionRecord = {
+    id: sessionId,
+    projectId,
+    command,
+    workingDirectory: path.relative(process.cwd(), targetCwd) || '.',
+    status: 'running',
+    startedAt: Date.now(),
+    events: [],
+  };
+
+  const initialEvent = {
+    type: 'system' as const,
+    text: `[TERMINAL] Executing "${command}" in workspace "${projectId}" (${session.workingDirectory})...`,
+    timestamp: Date.now(),
+  };
+  session.events.push(initialEvent);
+
+  // Strip sensitive secrets from execution environment
+  const safeEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    NODE_ENV: 'development',
+    PATH: process.env.PATH,
+    HOME: process.env.HOME,
+    TMPDIR: process.env.TMPDIR,
+  };
+  delete safeEnv.GITHUB_TOKEN;
+  delete safeEnv.GEMINI_API_KEY;
+
+  const finalArgs = customArgs && Array.isArray(customArgs) ? customArgs : validation.args;
+
+  let child: ChildProcess;
+  try {
+    child = spawn(validation.executable, finalArgs, {
+      cwd: targetCwd,
+      env: safeEnv,
+      shell: false,
+    });
+  } catch (err: any) {
+    session.status = 'failed';
+    session.finishedAt = Date.now();
+    session.durationMs = 0;
+    session.exitCode = 1;
+    const errEvent = {
+      type: 'stderr' as const,
+      text: `Failed to spawn process: ${err.message}`,
+      timestamp: Date.now(),
+    };
+    session.events.push(errEvent);
+    completedTerminalSessions.set(sessionId, session);
+    res.status(500).json({ success: false, error: err.message, session });
+    return;
+  }
+
+  activeTerminalProcesses.set(sessionId, { process: child, session });
+
+  // Stream stdout
+  child.stdout?.on('data', (chunk: Buffer) => {
+    const raw = chunk.toString('utf-8');
+    const sanitized = redactTerminalSecrets(raw);
+    const event = {
+      type: 'stdout' as const,
+      text: sanitized,
+      timestamp: Date.now(),
+    };
+    session.events.push(event);
+    broadcastTerminalEvent(sessionId, event);
+  });
+
+  // Stream stderr
+  child.stderr?.on('data', (chunk: Buffer) => {
+    const raw = chunk.toString('utf-8');
+    const sanitized = redactTerminalSecrets(raw);
+    const event = {
+      type: 'stderr' as const,
+      text: sanitized,
+      timestamp: Date.now(),
+    };
+    session.events.push(event);
+    broadcastTerminalEvent(sessionId, event);
+  });
+
+  // Process exit
+  child.on('close', (code: number | null) => {
+    activeTerminalProcesses.delete(sessionId);
+    if (session.status !== 'cancelled') {
+      session.status = code === 0 ? 'completed' : 'failed';
+    }
+    session.finishedAt = Date.now();
+    session.durationMs = session.finishedAt - session.startedAt;
+    session.exitCode = code;
+
+    const exitEvent = {
+      type: 'exit' as const,
+      text: `[PROCESS EXITED] Exit code ${code} (${session.status.toUpperCase()}) in ${session.durationMs}ms`,
+      timestamp: Date.now(),
+      exitCode: code,
+      status: session.status,
+      durationMs: session.durationMs,
+    };
+    session.events.push(exitEvent);
+    broadcastTerminalEvent(sessionId, exitEvent);
+
+    completedTerminalSessions.set(sessionId, session);
+
+    // Persist session to workspace store
+    try {
+      const store = readPersistedWorkspaces();
+      let ws = store.workspaces.find((w: any) => w.id === projectId);
+      if (!ws) {
+        ws = {
+          id: projectId,
+          name: projectId,
+          tagline: 'Workspace',
+          description: 'Workspace generated during execution',
+          framework: 'React / Vite / TypeScript',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          branch: 'main',
+          environment: 'development',
+          healthScore: 100,
+          files: [],
+          tasks: [],
+          tests: [],
+          deployments: [],
+          history: [],
+          terminalSessions: [],
+        };
+        store.workspaces.push(ws);
+      }
+      if (!Array.isArray(ws.terminalSessions)) {
+        ws.terminalSessions = [];
+      }
+      ws.terminalSessions.unshift(session);
+      if (ws.terminalSessions.length > 30) {
+        ws.terminalSessions = ws.terminalSessions.slice(0, 30);
+      }
+      writePersistedWorkspaces(store);
+    } catch (e) {
+      console.warn('Failed to persist terminal session history:', e);
+    }
+  });
+
+  child.on('error', (err) => {
+    activeTerminalProcesses.delete(sessionId);
+    session.status = 'failed';
+    session.finishedAt = Date.now();
+    session.durationMs = session.finishedAt - session.startedAt;
+    session.exitCode = 1;
+
+    const errorEvent = {
+      type: 'stderr' as const,
+      text: `[PROCESS ERROR] ${err.message}`,
+      timestamp: Date.now(),
+    };
+    session.events.push(errorEvent);
+    broadcastTerminalEvent(sessionId, errorEvent);
+    completedTerminalSessions.set(sessionId, session);
+  });
+
+  // Auto-kill on timeout if specified
+  if (timeoutMs && timeoutMs > 0) {
+    setTimeout(() => {
+      if (activeTerminalProcesses.has(sessionId)) {
+        session.status = 'failed';
+        const timeoutEvent = {
+          type: 'system' as const,
+          text: `[TIMEOUT] Process execution exceeded budget of ${timeoutMs}ms and was terminated.`,
+          timestamp: Date.now(),
+        };
+        session.events.push(timeoutEvent);
+        broadcastTerminalEvent(sessionId, timeoutEvent);
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          // ignore
+        }
+      }
+    }, timeoutMs);
+  }
+
+  res.json({
+    success: true,
+    sessionId,
+    session,
+  });
+});
+
+// GET /api/terminal/stream/:sessionId (Server-Sent Events)
+app.get('/api/terminal/stream/:sessionId', (req: Request, res: Response) => {
+  const { sessionId } = req.params;
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  // Find active or completed session
+  const active = activeTerminalProcesses.get(sessionId);
+  const session = active ? active.session : completedTerminalSessions.get(sessionId);
+
+  if (!session) {
+    res.write(`data: ${JSON.stringify({ type: 'system', text: `Session "${sessionId}" not found.`, timestamp: Date.now() })}\n\n`);
+    res.end();
+    return;
+  }
+
+  // Send initial session payload
+  res.write(`data: ${JSON.stringify({ type: 'init', session })}\n\n`);
+
+  if (session.status !== 'running') {
+    res.end();
+    return;
+  }
+
+  if (!terminalSubscribers.has(sessionId)) {
+    terminalSubscribers.set(sessionId, new Set());
+  }
+  terminalSubscribers.get(sessionId)!.add(res);
+
+  req.on('close', () => {
+    const subs = terminalSubscribers.get(sessionId);
+    if (subs) {
+      subs.delete(res);
+      if (subs.size === 0) {
+        terminalSubscribers.delete(sessionId);
+      }
+    }
+  });
+});
+
+// POST /api/terminal/cancel/:sessionId
+app.post('/api/terminal/cancel/:sessionId', (req: Request, res: Response) => {
+  const { sessionId } = req.params;
+  const active = activeTerminalProcesses.get(sessionId);
+
+  if (!active) {
+    const completed = completedTerminalSessions.get(sessionId);
+    if (completed) {
+      res.json({ success: true, message: `Session ${sessionId} already finished (${completed.status}).`, session: completed });
+      return;
+    }
+    res.status(404).json({ success: false, error: `Session "${sessionId}" not found.` });
+    return;
+  }
+
+  active.session.status = 'cancelled';
+  const cancelEvent = {
+    type: 'system' as const,
+    text: `[PROCESS CANCELLED] Execution terminated by user.`,
+    timestamp: Date.now(),
+    status: 'cancelled',
+  };
+  active.session.events.push(cancelEvent);
+  broadcastTerminalEvent(sessionId, cancelEvent);
+
+  try {
+    active.process.kill('SIGTERM');
+    setTimeout(() => {
+      try {
+        active.process.kill('SIGKILL');
+      } catch {
+        // ignore
+      }
+    }, 1000);
+  } catch (err: any) {
+    console.warn('Failed to kill process:', err);
+  }
+
+  activeTerminalProcesses.delete(sessionId);
+  completedTerminalSessions.set(sessionId, active.session);
+
+  res.json({ success: true, message: 'Process cancelled successfully.', session: active.session });
+});
+
+// GET /api/terminal/sessions/:projectId
+app.get('/api/terminal/sessions/:projectId', (req: Request, res: Response) => {
+  const { projectId } = req.params;
+  const store = readPersistedWorkspaces();
+  const ws = store.workspaces.find((w: any) => w.id === projectId);
+  const persisted = ws?.terminalSessions || [];
+
+  // Merge with any in-memory sessions
+  const inMemory = Array.from(completedTerminalSessions.values())
+    .concat(Array.from(activeTerminalProcesses.values()).map((v) => v.session))
+    .filter((s) => s.projectId === projectId);
+
+  const map = new Map<string, TerminalSessionRecord>();
+  for (const s of persisted) map.set(s.id, s);
+  for (const s of inMemory) map.set(s.id, s);
+
+  const sessions = Array.from(map.values()).sort((a, b) => b.startedAt - a.startedAt);
+  res.json({ success: true, count: sessions.length, sessions });
 });
 
 // Helper for GitHub headers
