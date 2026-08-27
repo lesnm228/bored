@@ -1,0 +1,259 @@
+import { ProjectConfig, ProjectFile, TaskItem } from '../types';
+import { initialProjects } from '../data/initialData';
+
+const STORAGE_KEY_PROJECTS = 'builder_board_projects_v2';
+const STORAGE_KEY_ACTIVE = 'builder_board_active_proj_v2';
+
+export class ProjectService {
+  /**
+   * Load all saved projects from persistent storage or seed default
+   */
+  public static loadProjects(): ProjectConfig[] {
+    try {
+      const stored = localStorage.getItem(STORAGE_KEY_PROJECTS);
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          return parsed;
+        }
+      }
+    } catch (e) {
+      console.warn('Failed to load projects from localStorage:', e);
+    }
+    return initialProjects;
+  }
+
+  /**
+   * Persist projects to local storage
+   */
+  public static saveProjects(projects: ProjectConfig[]): void {
+    try {
+      localStorage.setItem(STORAGE_KEY_PROJECTS, JSON.stringify(projects));
+    } catch (e) {
+      console.error('Failed to save projects to localStorage:', e);
+    }
+  }
+
+  /**
+   * Load active project ID
+   */
+  public static getActiveProjectId(projects: ProjectConfig[]): string {
+    const active = localStorage.getItem(STORAGE_KEY_ACTIVE);
+    if (active && projects.some((p) => p.id === active)) {
+      return active;
+    }
+    return projects[0]?.id || '';
+  }
+
+  /**
+   * Save active project ID
+   */
+  public static setActiveProjectId(id: string): void {
+    localStorage.setItem(STORAGE_KEY_ACTIVE, id);
+  }
+
+  /**
+   * Create a new project workspace with genuine files and initial structure
+   */
+  public static createProject(params: {
+    name: string;
+    tagline?: string;
+    description?: string;
+    framework?: string;
+    template?: 'minimal' | 'node_api' | 'react_app' | 'microservice';
+  }): ProjectConfig {
+    const timestamp = Date.now();
+    const cleanName = params.name.trim() || 'New Software Project';
+    const slug = cleanName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+    const framework = params.framework || 'Node.js / Express / TypeScript';
+
+    const defaultFiles: ProjectFile[] = [
+      {
+        id: `f-${timestamp}-1`,
+        path: 'src/index.ts',
+        name: 'index.ts',
+        language: 'typescript',
+        content: `/**
+ * ${cleanName}
+ * ${params.tagline || 'Autonomous Software Service'}
+ */
+
+import express, { Request, Response } from 'express';
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(express.json());
+
+app.get('/health', (_req: Request, res: Response) => {
+  res.json({
+    status: 'healthy',
+    timestamp: Date.now(),
+    service: '${slug}',
+    version: '1.0.0'
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(\`⚡ ${cleanName} listening on port \${PORT}\`);
+});
+`,
+        lastModified: timestamp,
+      },
+      {
+        id: `f-${timestamp}-2`,
+        path: 'package.json',
+        name: 'package.json',
+        language: 'json',
+        content: JSON.stringify(
+          {
+            name: slug,
+            version: '1.0.0',
+            description: params.description || 'Constructed with Builder Board workspace',
+            main: 'src/index.ts',
+            type: 'module',
+            scripts: {
+              dev: 'tsx watch src/index.ts',
+              build: 'tsc',
+              test: 'vitest run',
+            },
+            dependencies: {
+              express: '^4.21.2',
+            },
+            devDependencies: {
+              '@types/express': '^4.17.21',
+              '@types/node': '^22.14.0',
+              typescript: '^5.8.2',
+              vitest: '^2.0.0',
+            },
+          },
+          null,
+          2
+        ),
+        lastModified: timestamp,
+      },
+      {
+        id: `f-${timestamp}-3`,
+        path: 'README.md',
+        name: 'README.md',
+        language: 'markdown',
+        content: `# ${cleanName}
+
+${params.description || params.tagline || 'Autonomous software workspace initialized in Builder Board.'}
+
+## Tech Stack
+- **Framework**: ${framework}
+- **Language**: TypeScript
+
+## Getting Started
+\`\`\`bash
+npm install
+npm run dev
+\`\`\`
+`,
+        lastModified: timestamp,
+      },
+    ];
+
+    const initialTask: TaskItem = {
+      id: `task-${timestamp}-1`,
+      title: `Bootstrap ${cleanName} architecture`,
+      description: params.description || 'Initialize core interfaces, types, and foundational application logic.',
+      status: 'pending',
+      priority: 'high',
+      assignedTo: 'builder-agent',
+      targetFiles: ['src/index.ts', 'package.json'],
+      createdAt: timestamp,
+      subtasks: [
+        { id: `sub-${timestamp}-1`, title: 'Define data models and route interfaces', completed: false },
+        { id: `sub-${timestamp}-2`, title: 'Implement application business logic', completed: false },
+        { id: `sub-${timestamp}-3`, title: 'Add Vitest unit verification tests', completed: false },
+      ],
+    };
+
+    return {
+      id: `proj-${timestamp}-${Math.random().toString(36).substring(2, 7)}`,
+      name: cleanName,
+      tagline: params.tagline || 'Custom autonomous software service',
+      description: params.description || 'Full-stack application maintained via Builder Board.',
+      framework,
+      branch: 'main',
+      environment: 'development',
+      healthScore: 100,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastActive: timestamp,
+      files: defaultFiles,
+      tasks: [initialTask],
+      tests: [
+        {
+          id: `test-${timestamp}-1`,
+          name: 'should respond 200 OK on GET /health',
+          file: 'test/health.test.ts',
+          suite: 'Health Suite',
+          status: 'idle',
+          durationMs: 0,
+        },
+      ],
+      deployments: [],
+      history: [
+        {
+          id: `hist-${timestamp}-1`,
+          timestamp,
+          type: 'milestone',
+          title: `Project workspace "${cleanName}" initialized`,
+          description: `Created initial repository structure with ${defaultFiles.length} files.`,
+          author: 'Kelvin (Owner)',
+        },
+      ],
+      envVariables: [
+        { key: 'PORT', value: '3000', isSecret: false },
+        { key: 'NODE_ENV', value: 'development', isSecret: false },
+      ],
+    };
+  }
+
+  /**
+   * Import project from parsed JSON
+   */
+  public static importProjectFromJson(data: unknown): ProjectConfig {
+    if (!data || typeof data !== 'object') {
+      throw new Error('Invalid project file: expected a JSON object');
+    }
+    const obj = data as Record<string, any>;
+    if (!obj.name || !Array.isArray(obj.files)) {
+      throw new Error('Invalid project structure: "name" and "files" array are required');
+    }
+
+    const timestamp = Date.now();
+    return {
+      id: `proj-import-${timestamp}-${Math.random().toString(36).substring(2, 6)}`,
+      name: String(obj.name),
+      tagline: String(obj.tagline || 'Imported Workspace'),
+      description: String(obj.description || 'Imported into Builder Board'),
+      framework: String(obj.framework || 'TypeScript / Node.js'),
+      branch: String(obj.branch || 'main'),
+      environment: 'development',
+      healthScore: typeof obj.healthScore === 'number' ? obj.healthScore : 95,
+      createdAt: typeof obj.createdAt === 'number' ? obj.createdAt : timestamp,
+      updatedAt: timestamp,
+      lastActive: timestamp,
+      files: Array.isArray(obj.files) ? obj.files : [],
+      tasks: Array.isArray(obj.tasks) ? obj.tasks : [],
+      tests: Array.isArray(obj.tests) ? obj.tests : [],
+      deployments: Array.isArray(obj.deployments) ? obj.deployments : [],
+      history: [
+        ...(Array.isArray(obj.history) ? obj.history : []),
+        {
+          id: `hist-${timestamp}`,
+          timestamp,
+          type: 'milestone',
+          title: `Project "${obj.name}" imported into workspace`,
+          description: `Loaded ${obj.files?.length || 0} files and ${obj.tasks?.length || 0} tasks.`,
+          author: 'User',
+        },
+      ],
+      envVariables: Array.isArray(obj.envVariables) ? obj.envVariables : [],
+    };
+  }
+}

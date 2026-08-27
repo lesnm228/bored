@@ -1,0 +1,6 @@
+{
+  "name": "Builder Board",
+  "description": "Production software-building workspace and autonomous builder agent featuring multi-project management, real file editing, tasks, tests, deployments, logs, and agent execution.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
