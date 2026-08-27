@@ -1,5 +1,7 @@
 import { ProjectConfig, ProjectFile, TaskItem, TestCase, LogEntry, AgentRunState, AutonomyLevel } from '../types';
 import { buildWorkspaceDependencyGraph, validateWorkspacePath } from './dependencyGraph';
+import { TerminalService } from './terminalService';
+import { GitService } from './gitService';
 
 export interface AgentExecutionCallbacks {
   onStateChange: (state: AgentRunState) => void;
@@ -109,6 +111,8 @@ export class AutonomousAgentEngine {
     this.isRunning = true;
     this.abortController = new AbortController();
     const signal = this.abortController.signal;
+    let workingFiles = project.files.map((file) => ({ ...file }));
+    const originalFiles = project.files.map((file) => ({ ...file }));
 
     const runState: AgentRunState = {
       status: 'planning',
@@ -214,7 +218,7 @@ export class AutonomousAgentEngine {
       addThought('Plan Created', `Identified ${planResult.tasks.length} critical tasks: ${planResult.summary}`, 'observation');
 
       // Keep snapshot of workspace files for overall rollback if needed
-      let workingFiles = [...project.files];
+      addThought('Snapshot', `Created rollback checkpoint for ${originalFiles.length} workspace files.`, 'verification');
 
       // Phase 2: Execute each task (Multi-file enabled)
       for (let i = 0; i < planResult.tasks.length; i++) {
@@ -547,17 +551,95 @@ export class AutonomousAgentEngine {
               });
             }
           }
+          if (testData.status === 'failed' || testData.failed === true) {
+            throw new Error('Configured tests failed.');
+          }
+          if (testData.configured === false) {
+            addThought('Testing', 'TEST STATUS: NOT CONFIGURED', 'observation');
+          }
         }
       } catch (tErr) {
         if (signal.aborted) throw new Error('Aborted by user');
-        console.warn('Real test runner fallback:', tErr);
+        throw new Error(`Test execution failed: ${tErr instanceof Error ? tErr.message : String(tErr)}`);
       }
+
+      const runTerminalCheck = async (command: string, phase: string) => {
+        if (signal.aborted) throw new Error('Aborted by user');
+        runState.status = 'validating';
+        callbacks.onStateChange({ ...runState });
+        addThought(phase, `Executing real command: ${command}`, 'action');
+        const result = await TerminalService.executeAndWait({
+          projectId: project.id,
+          command,
+          files: workingFiles.map((file) => ({ path: file.path, content: file.content })),
+          timeoutMs: 120000,
+          onEvent: (event) => callbacks.onLog({
+            id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            timestamp: event.timestamp,
+            level: event.type === 'stderr' ? 'error' : 'info',
+            source: 'terminal',
+            message: event.text,
+          }),
+        });
+        if (result.session.status !== 'completed' || result.session.exitCode !== 0) {
+          throw new Error(`${command} failed with exit code ${result.session.exitCode ?? 'unknown'}.`);
+        }
+        addThought(`${phase} Complete`, `${command} completed successfully in ${result.session.durationMs ?? 0}ms.`, 'verification');
+      };
+
+      await runTerminalCheck('npm run lint', 'Validating');
+      await runTerminalCheck('npm run build', 'Building');
+
+      runState.status = 'reviewing';
+      callbacks.onStateChange({ ...runState });
+      const diffs = GitService.computeWorkspaceDiff(
+        originalFiles,
+        workingFiles
+      ).filter((diff) => diff.isModified);
+      addThought('Reviewing', `Real workspace diff contains ${diffs.length} changed file(s).`, 'verification');
+      if (diffs.length === 0) {
+        throw new Error('No file changes were produced; refusing to commit an empty run.');
+      }
+
+      if (!project.githubRepo) {
+        runState.status = 'blocked';
+        callbacks.onStateChange({ ...runState });
+        throw new Error('BLOCKED: No GitHub repository is configured for this project.');
+      }
+
+      runState.status = 'committing';
+      callbacks.onStateChange({ ...runState });
+      addThought('Committing', 'Submitting the reviewed file diff to the configured remote.', 'action');
+      const pushResult = await GitService.commitAndPush({
+        owner: project.githubRepo.owner,
+        repo: project.githubRepo.repo,
+        branch: project.githubRepo.branch || project.branch,
+        message: `Builder Agent: ${goal.slice(0, 72)}`,
+        files: workingFiles
+          .filter((file) => diffs.some((diff) => diff.path === file.path))
+          .map((file) => ({ path: file.path, content: file.content })),
+      });
+      if (pushResult.blocked) {
+        runState.status = 'blocked';
+        callbacks.onStateChange({ ...runState });
+        throw new Error(pushResult.reason || 'BLOCKED: Remote push was not authorized.');
+      }
+      if (!pushResult.success || !pushResult.commitSha) {
+        throw new Error(pushResult.error || 'Commit and push failed.');
+      }
+
+      runState.status = 'verifying';
+      callbacks.onStateChange({ ...runState });
+      if (pushResult.verifiedRemoteSha !== pushResult.commitSha) {
+        throw new Error('Remote SHA verification failed: pushed and fetched SHAs differ.');
+      }
+      addThought('Verified', `PUSH VERIFIED: remote SHA ${pushResult.verifiedRemoteSha}.`, 'verification');
 
       runState.status = 'completed';
       runState.completedAt = Date.now();
       callbacks.onStateChange({ ...runState });
       addThought('Complete', 'All multi-file tasks executed, types verified via esbuild, and sandbox test suites executed.', 'verification');
-      callbacks.onCompleted(`Goal successfully fulfilled: "${goal}". Multi-file changes verified in sandbox.`);
+      callbacks.onCompleted(`Goal successfully fulfilled: "${goal}". Real typecheck and build passed.`);
     } catch (err: unknown) {
       const errorMsg = err instanceof Error ? err.message : 'Unknown execution error';
       if (errorMsg === 'Aborted by user') {
@@ -571,7 +653,13 @@ export class AutonomousAgentEngine {
           message: '⛔ Agent execution aborted by user override.',
         });
       } else {
-        runState.status = 'error';
+        const isBlocked = errorMsg.startsWith('BLOCKED:');
+        if (!isBlocked) {
+          workingFiles = originalFiles;
+          originalFiles.forEach((file) => callbacks.onFileUpdate(file));
+          addThought('Rollback', 'Restored the rollback checkpoint after an unsafe failed run.', 'verification');
+        }
+        runState.status = isBlocked ? 'blocked' : 'error';
         runState.error = errorMsg;
         addThought('Error', `Execution halted: ${errorMsg}`, 'action');
         callbacks.onError(errorMsg);

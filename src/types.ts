@@ -11,13 +11,20 @@ export type WorkspaceView =
 
 export type AgentStatus =
   | 'idle'
+  | 'queued'
   | 'planning'
+  | 'inspecting'
   | 'synthesizing'
   | 'writing_code'
   | 'running_tests'
   | 'validating'
   | 'self_correcting'
+  | 'reviewing'
+  | 'committing'
+  | 'pushing'
+  | 'verifying'
   | 'completed'
+  | 'blocked'
   | 'error'
   | 'aborted';
 
