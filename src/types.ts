@@ -187,6 +187,17 @@ export interface ProjectConfig {
     lastSyncedCommitSha?: string;
   };
   gitBaselineFiles?: { path: string; content: string }[];
+  agentContext?: {
+    purpose?: string;
+    framework?: string;
+    architecture?: string[];
+    importantFiles?: string[];
+    latestWorkingState?: string;
+    currentBlocker?: string;
+    lastSuccessfulBuild?: number;
+    recentTaskHistory?: { title: string; status: string; timestamp: number }[];
+    checkpoint?: { taskId: string; phase: string; stepIndex: number; status: string; updatedAt: number };
+  };
 }
 
 export interface AgentRunState {

@@ -37,6 +37,32 @@ interface PersistedStore {
   workspaces: any[];
 }
 
+function sanitizeAgentContext(context: any): any {
+  if (!context || typeof context !== 'object') return {};
+  const allowed = {
+    purpose: typeof context.purpose === 'string' ? context.purpose.slice(0, 2000) : '',
+    framework: typeof context.framework === 'string' ? context.framework.slice(0, 200) : '',
+    architecture: Array.isArray(context.architecture) ? context.architecture.filter((item: any) => typeof item === 'string').slice(-20) : [],
+    importantFiles: Array.isArray(context.importantFiles) ? context.importantFiles.filter((item: any) => typeof item === 'string').slice(-100) : [],
+    latestWorkingState: typeof context.latestWorkingState === 'string' ? context.latestWorkingState.slice(0, 2000) : '',
+    currentBlocker: typeof context.currentBlocker === 'string' ? context.currentBlocker.slice(0, 2000) : '',
+    lastSuccessfulBuild: typeof context.lastSuccessfulBuild === 'number' ? context.lastSuccessfulBuild : undefined,
+    recentTaskHistory: Array.isArray(context.recentTaskHistory) ? context.recentTaskHistory.slice(-20).map((item: any) => ({
+      title: typeof item.title === 'string' ? item.title.slice(0, 500) : '',
+      status: typeof item.status === 'string' ? item.status.slice(0, 40) : '',
+      timestamp: typeof item.timestamp === 'number' ? item.timestamp : Date.now(),
+    })) : [],
+    checkpoint: context.checkpoint && typeof context.checkpoint === 'object' ? {
+      taskId: typeof context.checkpoint.taskId === 'string' ? context.checkpoint.taskId.slice(0, 120) : '',
+      phase: typeof context.checkpoint.phase === 'string' ? context.checkpoint.phase.slice(0, 80) : '',
+      stepIndex: Number.isInteger(context.checkpoint.stepIndex) ? context.checkpoint.stepIndex : 0,
+      status: typeof context.checkpoint.status === 'string' ? context.checkpoint.status.slice(0, 40) : '',
+      updatedAt: typeof context.checkpoint.updatedAt === 'number' ? context.checkpoint.updatedAt : Date.now(),
+    } : undefined,
+  };
+  return allowed;
+}
+
 function sanitizeWorkspaceForPersistence(ws: any): any {
   if (!ws || typeof ws !== 'object') return ws;
   const clone = JSON.parse(JSON.stringify(ws));
@@ -163,6 +189,36 @@ app.get('/api/workspaces/:id', (req: Request, res: Response) => {
     return;
   }
   res.json({ success: true, workspace });
+});
+
+app.get('/api/workspaces/:id/agent-context', (req: Request, res: Response) => {
+  try {
+    getWorkspaceRoot(req.params.id);
+  } catch (err: any) {
+    res.status(400).json({ success: false, error: err.message });
+    return;
+  }
+  const workspace = readPersistedWorkspaces().workspaces.find((w: any) => w.id === req.params.id);
+  res.json({ success: true, context: sanitizeAgentContext(workspace?.agentContext || {}) });
+});
+
+app.post('/api/workspaces/:id/agent-context', (req: Request, res: Response) => {
+  try {
+    getWorkspaceRoot(req.params.id);
+  } catch (err: any) {
+    res.status(400).json({ success: false, error: err.message });
+    return;
+  }
+  const store = readPersistedWorkspaces();
+  const workspace = store.workspaces.find((w: any) => w.id === req.params.id);
+  if (!workspace) {
+    res.status(404).json({ success: false, error: 'Workspace not found.' });
+    return;
+  }
+  workspace.agentContext = sanitizeAgentContext(req.body?.context);
+  workspace.updatedAt = Date.now();
+  writePersistedWorkspaces(store);
+  res.json({ success: true, context: workspace.agentContext });
 });
 
 app.post('/api/workspaces', (req: Request, res: Response) => {

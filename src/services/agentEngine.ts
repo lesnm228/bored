@@ -50,6 +50,34 @@ export class AutonomousAgentEngine {
     this.listeners.forEach((l) => l(currentState));
   }
 
+  private async persistAgentContext(project: ProjectConfig, state: AgentRunState): Promise<void> {
+    const context = {
+      purpose: project.description,
+      framework: project.framework,
+      importantFiles: project.files.map((file) => file.path),
+      latestWorkingState: state.status,
+      currentBlocker: state.error || '',
+      lastSuccessfulBuild: state.status === 'completed' ? Date.now() : project.agentContext?.lastSuccessfulBuild,
+      recentTaskHistory: project.tasks.slice(0, 20).map((task) => ({
+        title: task.title,
+        status: task.status,
+        timestamp: task.completedAt || task.createdAt,
+      })),
+      checkpoint: {
+        taskId: project.tasks[project.tasks.length - 1]?.id || '',
+        phase: state.status,
+        stepIndex: state.currentStepIndex,
+        status: state.status,
+        updatedAt: Date.now(),
+      },
+    };
+    await fetch(`/api/workspaces/${encodeURIComponent(project.id)}/agent-context`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ context }),
+    }).catch(() => undefined);
+  }
+
   private buildTaskManagerProjectFiles(projectName: string, projectId: string, instruction: string): ProjectFile[] {
     const safeName = projectName.trim() || 'Task Manager';
     const safeId = projectId.replace(/[^a-zA-Z0-9_-]/g, '-');
@@ -571,11 +599,24 @@ button, input { font: inherit; }
     onLog: (msg: string, level?: any, source?: string) => void
   ): Promise<void> {
     let currentProj = { ...project };
+    let resumeFromStep = 0;
+    try {
+      const contextRes = await fetch(`/api/workspaces/${encodeURIComponent(project.id)}/agent-context`);
+      if (contextRes.ok) {
+        const contextData = await contextRes.json();
+        resumeFromStep = contextData.context?.checkpoint?.status === 'aborted'
+          ? Math.max(0, Number(contextData.context.checkpoint.stepIndex) - 1)
+          : 0;
+      }
+    } catch {
+      resumeFromStep = 0;
+    }
 
     await this.executeGoal(goal, project, {
       onStateChange: (newState) => {
         this.state = newState;
         this.notifyListeners();
+        this.persistAgentContext(currentProj, newState);
       },
       onLog: (log) => {
         onLog(log.message, log.level, log.source);
@@ -587,6 +628,7 @@ button, input { font: inherit; }
           : [...currentProj.files, updatedFile];
         currentProj = { ...currentProj, files: newFiles, updatedAt: Date.now() };
         onProjectUpdate(currentProj);
+        this.persistAgentContext(currentProj, this.state);
       },
       onTaskUpdate: (updatedTask) => {
         const taskExists = currentProj.tasks.some((t) => t.id === updatedTask.id);
@@ -595,6 +637,7 @@ button, input { font: inherit; }
           : [updatedTask, ...currentProj.tasks];
         currentProj = { ...currentProj, tasks: newTasks, updatedAt: Date.now() };
         onProjectUpdate(currentProj);
+        this.persistAgentContext(currentProj, this.state);
       },
       onTestUpdate: (updatedTest) => {
         const newTests = currentProj.tests.map((t) =>
@@ -609,13 +652,15 @@ button, input { font: inherit; }
       onError: (err) => {
         onLog(`Agent error: ${err}`, 'error', 'AGENT');
       },
-    });
+    }, resumeFromStep);
+    await this.persistAgentContext(currentProj, this.state);
   }
 
   public async executeGoal(
     goal: string,
     project: ProjectConfig,
-    callbacks: AgentExecutionCallbacks
+    callbacks: AgentExecutionCallbacks,
+    resumeFromStep = 0
   ): Promise<void> {
     if (this.isRunning) {
       callbacks.onLog({
@@ -741,7 +786,7 @@ button, input { font: inherit; }
       addThought('Snapshot', `Created rollback checkpoint for ${originalFiles.length} workspace files.`, 'verification');
 
       // Phase 2: Execute each task (Multi-file enabled)
-      for (let i = 0; i < planResult.tasks.length; i++) {
+      for (let i = resumeFromStep; i < planResult.tasks.length; i++) {
         if (signal.aborted) throw new Error('Aborted by user');
 
         const taskDef = planResult.tasks[i];

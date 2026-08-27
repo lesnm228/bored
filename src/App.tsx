@@ -136,6 +136,23 @@ export default function App() {
     setLogs((prev) => [...prev.slice(-400), entry]);
   }, []);
 
+  useEffect(() => {
+    if (!currentProjectId) return;
+    fetch(`/api/workspaces/${encodeURIComponent(currentProjectId)}/agent-context`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        const checkpoint = data?.context?.checkpoint;
+        if (checkpoint && !['completed', 'idle'].includes(checkpoint.status)) {
+          appendLog(
+            `Recovered Builder Agent checkpoint: ${checkpoint.status} at step ${checkpoint.stepIndex}.`,
+            'info',
+            'AGENT',
+          );
+        }
+      })
+      .catch(() => undefined);
+  }, [appendLog, currentProjectId]);
+
   // Initialize startup logs
   useEffect(() => {
     appendLog('Builder Board workspace engine initialized.', 'info', 'SYSTEM');
