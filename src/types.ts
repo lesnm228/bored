@@ -18,6 +18,7 @@ export type AgentStatus =
   | 'writing_code'
   | 'running_tests'
   | 'validating'
+  | 'building'
   | 'self_correcting'
   | 'reviewing'
   | 'committing'

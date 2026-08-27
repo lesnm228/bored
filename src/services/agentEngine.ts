@@ -565,7 +565,7 @@ export class AutonomousAgentEngine {
 
       const runTerminalCheck = async (command: string, phase: string) => {
         if (signal.aborted) throw new Error('Aborted by user');
-        runState.status = 'validating';
+        runState.status = phase === 'Building' ? 'building' : 'validating';
         callbacks.onStateChange({ ...runState });
         addThought(phase, `Executing real command: ${command}`, 'action');
         const result = await TerminalService.executeAndWait({
@@ -610,6 +610,8 @@ export class AutonomousAgentEngine {
       runState.status = 'committing';
       callbacks.onStateChange({ ...runState });
       addThought('Committing', 'Submitting the reviewed file diff to the configured remote.', 'action');
+      runState.status = 'pushing';
+      callbacks.onStateChange({ ...runState });
       const pushResult = await GitService.commitAndPush({
         owner: project.githubRepo.owner,
         repo: project.githubRepo.repo,
