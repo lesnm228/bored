@@ -11,21 +11,13 @@ export type WorkspaceView =
 
 export type AgentStatus =
   | 'idle'
-  | 'queued'
   | 'planning'
-  | 'inspecting'
   | 'synthesizing'
   | 'writing_code'
   | 'running_tests'
   | 'validating'
-  | 'building'
   | 'self_correcting'
-  | 'reviewing'
-  | 'committing'
-  | 'pushing'
-  | 'verifying'
   | 'completed'
-  | 'blocked'
   | 'error'
   | 'aborted';
 
@@ -187,28 +179,6 @@ export interface ProjectConfig {
     lastSyncedCommitSha?: string;
   };
   gitBaselineFiles?: { path: string; content: string }[];
-  agentContext?: {
-    purpose?: string;
-    framework?: string;
-    architecture?: string[];
-    importantFiles?: string[];
-    latestWorkingState?: string;
-    currentBlocker?: string;
-    lastSuccessfulBuild?: number;
-    recentTaskHistory?: { title: string; status: string; timestamp: number }[];
-    checkpoint?: { taskId: string; phase: string; stepIndex: number; status: string; updatedAt: number; integrity?: boolean };
-    instruction?: string;
-    plan?: { summary: string; estimatedSteps: number; tasks: unknown[]; reasoning: string[] };
-    lifecycleStatus?: string;
-    completedSteps?: string[];
-    pendingSteps?: string[];
-    affectedFiles?: string[];
-    rollback?: { checkpointId: string; fileCount: number; integrity: boolean };
-    lastValidation?: { status: string; exitCode?: number; command: string; durationMs?: number; timestamp: number };
-    lastBuild?: { status: string; exitCode?: number; command: string; durationMs?: number; timestamp: number };
-    resumeEligible?: boolean;
-    updatedAt?: number;
-  };
 }
 
 export interface AgentRunState {
