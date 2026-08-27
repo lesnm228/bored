@@ -1,12 +1,34 @@
 import { ProjectConfig, ProjectFile, TaskItem } from '../types';
 import { initialProjects } from '../data/initialData';
 
-const STORAGE_KEY_PROJECTS = 'builder_board_projects_v2';
-const STORAGE_KEY_ACTIVE = 'builder_board_active_proj_v2';
+const STORAGE_KEY_PROJECTS = 'builder_board_projects_v3';
+const STORAGE_KEY_ACTIVE = 'builder_board_active_proj_v3';
+const CURRENT_SCHEMA_VERSION = 1;
 
 export class ProjectService {
   /**
-   * Load all saved projects from persistent storage or seed default
+   * Sanitizes a project config to guarantee no secrets, auth tokens, or private keys are saved
+   */
+  public static sanitizeProject(project: ProjectConfig): ProjectConfig {
+    const clone = JSON.parse(JSON.stringify(project)) as ProjectConfig;
+    if (Array.isArray(clone.envVariables)) {
+      clone.envVariables = clone.envVariables.map((ev) => {
+        const isSecretKey = /token|secret|password|api_?key|auth|credential/i.test(ev.key || '');
+        if (ev.isSecret || isSecretKey) {
+          return {
+            ...ev,
+            isSecret: true,
+            value: '[REDACTED_SECRET]',
+          };
+        }
+        return ev;
+      });
+    }
+    return clone;
+  }
+
+  /**
+   * Load all saved projects from local storage synchronously
    */
   public static loadProjects(): ProjectConfig[] {
     try {
@@ -24,13 +46,95 @@ export class ProjectService {
   }
 
   /**
-   * Persist projects to local storage
+   * Asynchronously fetch durable persisted workspaces from server filesystem
    */
-  public static saveProjects(projects: ProjectConfig[]): void {
+  public static async fetchWorkspacesFromServer(): Promise<{
+    workspaces: ProjectConfig[];
+    activeProjectId?: string;
+  } | null> {
     try {
-      localStorage.setItem(STORAGE_KEY_PROJECTS, JSON.stringify(projects));
+      const res = await fetch('/api/workspaces');
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (data.success && Array.isArray(data.workspaces) && data.workspaces.length > 0) {
+        // Cache to localStorage for fast future loads
+        try {
+          localStorage.setItem(STORAGE_KEY_PROJECTS, JSON.stringify(data.workspaces));
+          if (data.activeProjectId) {
+            localStorage.setItem(STORAGE_KEY_ACTIVE, data.activeProjectId);
+          }
+        } catch {
+          // ignore quota issues
+        }
+        return {
+          workspaces: data.workspaces,
+          activeProjectId: data.activeProjectId,
+        };
+      }
+    } catch (err) {
+      console.warn('Server workspace fetch skipped/failed (using client storage):', err);
+    }
+    return null;
+  }
+
+  /**
+   * Persist projects to both local storage and server disk
+   */
+  public static saveProjects(projects: ProjectConfig[], activeId?: string): void {
+    try {
+      const sanitized = projects.map(ProjectService.sanitizeProject);
+      localStorage.setItem(STORAGE_KEY_PROJECTS, JSON.stringify(sanitized));
+
+      // Async sync to server disk
+      fetch('/api/workspaces', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          workspaces: sanitized,
+          activeProjectId: activeId,
+          schemaVersion: CURRENT_SCHEMA_VERSION,
+        }),
+      }).catch((err) => {
+        console.warn('Failed to push workspaces to server storage:', err);
+      });
     } catch (e) {
-      console.error('Failed to save projects to localStorage:', e);
+      console.error('Failed to save projects:', e);
+    }
+  }
+
+  /**
+   * Save a single workspace to server disk
+   */
+  public static async saveSingleWorkspace(project: ProjectConfig): Promise<boolean> {
+    try {
+      const sanitized = ProjectService.sanitizeProject(project);
+      const res = await fetch('/api/workspaces', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          workspace: sanitized,
+          schemaVersion: CURRENT_SCHEMA_VERSION,
+        }),
+      });
+      return res.ok;
+    } catch (err) {
+      console.warn('Failed to save single workspace:', err);
+      return false;
+    }
+  }
+
+  /**
+   * Delete a workspace from server disk and local storage
+   */
+  public static async deleteProjectFromServer(id: string): Promise<boolean> {
+    try {
+      const res = await fetch(`/api/workspaces/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      });
+      return res.ok;
+    } catch (err) {
+      console.warn('Failed to delete workspace from server:', err);
+      return false;
     }
   }
 

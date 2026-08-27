@@ -46,8 +46,8 @@ export default function App() {
 
   // Save to persistent storage when state changes
   useEffect(() => {
-    ProjectService.saveProjects(projects);
-  }, [projects]);
+    ProjectService.saveProjects(projects, currentProjectId);
+  }, [projects, currentProjectId]);
 
   useEffect(() => {
     ProjectService.setActiveProjectId(currentProjectId);
@@ -56,6 +56,22 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('builder_board_settings', JSON.stringify(settings));
   }, [settings]);
+
+  // Synchronize with durable server filesystem storage on startup
+  useEffect(() => {
+    let isMounted = true;
+    ProjectService.fetchWorkspacesFromServer().then((serverData) => {
+      if (isMounted && serverData && serverData.workspaces.length > 0) {
+        setProjects(serverData.workspaces);
+        if (serverData.activeProjectId && serverData.workspaces.some((p) => p.id === serverData.activeProjectId)) {
+          setCurrentProjectId(serverData.activeProjectId);
+        }
+      }
+    });
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   // Subscribe to autonomous agent engine
   useEffect(() => {
@@ -122,6 +138,7 @@ export default function App() {
 
   const handleDeleteProject = (projectId: string) => {
     if (projects.length <= 1) return;
+    ProjectService.deleteProjectFromServer(projectId);
     setProjects((prev) => prev.filter((p) => p.id !== projectId));
     const remaining = projects.filter((p) => p.id !== projectId);
     if (remaining.length > 0) {

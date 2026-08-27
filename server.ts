@@ -1,5 +1,6 @@
 import express, { Request, Response } from 'express';
 import path from 'path';
+import fs from 'fs';
 import vm from 'node:vm';
 import * as esbuild from 'esbuild';
 import { createServer as createViteServer } from 'vite';
@@ -12,6 +13,99 @@ const app = express();
 const PORT = 3000;
 
 app.use(express.json({ limit: '10mb' }));
+
+// Durable Filesystem Workspace Storage Engine
+const DATA_DIR = path.join(process.cwd(), '.data');
+const WORKSPACES_FILE = path.join(DATA_DIR, 'workspaces.json');
+const SCHEMA_VERSION = 1;
+
+function ensureDataDir(): void {
+  if (!fs.existsSync(DATA_DIR)) {
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    } catch (err) {
+      console.warn('Could not create .data directory:', err);
+    }
+  }
+}
+
+interface PersistedStore {
+  schemaVersion: number;
+  lastSaved: number;
+  activeProjectId?: string;
+  workspaces: any[];
+}
+
+function sanitizeWorkspaceForPersistence(ws: any): any {
+  if (!ws || typeof ws !== 'object') return ws;
+  const clone = JSON.parse(JSON.stringify(ws));
+
+  // Strip any raw secrets from envVariables
+  if (Array.isArray(clone.envVariables)) {
+    clone.envVariables = clone.envVariables.map((ev: any) => {
+      const isSecretKey = /token|secret|password|api_?key|auth|credential/i.test(ev.key || '');
+      if (ev.isSecret || isSecretKey) {
+        return {
+          ...ev,
+          isSecret: true,
+          value: '[REDACTED_SECRET]',
+        };
+      }
+      return ev;
+    });
+  }
+
+  // Ensure no GITHUB_TOKEN or auth secrets are stored in custom fields
+  delete clone.githubToken;
+  delete clone.token;
+  delete clone.secret;
+  delete clone.apiKey;
+
+  return clone;
+}
+
+function readPersistedWorkspaces(): PersistedStore {
+  ensureDataDir();
+  if (!fs.existsSync(WORKSPACES_FILE)) {
+    return {
+      schemaVersion: SCHEMA_VERSION,
+      lastSaved: Date.now(),
+      workspaces: [],
+    };
+  }
+  try {
+    const raw = fs.readFileSync(WORKSPACES_FILE, 'utf-8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && Array.isArray(parsed.workspaces)) {
+      return {
+        schemaVersion: parsed.schemaVersion || SCHEMA_VERSION,
+        lastSaved: parsed.lastSaved || Date.now(),
+        activeProjectId: parsed.activeProjectId,
+        workspaces: parsed.workspaces,
+      };
+    }
+  } catch (err) {
+    console.warn('Failed to read workspaces.json:', err);
+  }
+  return {
+    schemaVersion: SCHEMA_VERSION,
+    lastSaved: Date.now(),
+    workspaces: [],
+  };
+}
+
+function writePersistedWorkspaces(store: PersistedStore): void {
+  ensureDataDir();
+  const sanitizedStore: PersistedStore = {
+    schemaVersion: SCHEMA_VERSION,
+    lastSaved: Date.now(),
+    activeProjectId: store.activeProjectId,
+    workspaces: (store.workspaces || []).map(sanitizeWorkspaceForPersistence),
+  };
+  const tmpFile = `${WORKSPACES_FILE}.tmp-${Date.now()}`;
+  fs.writeFileSync(tmpFile, JSON.stringify(sanitizedStore, null, 2), 'utf-8');
+  fs.renameSync(tmpFile, WORKSPACES_FILE);
+}
 
 // Lazy init GenAI client if key is configured
 function getGeminiClient(): GoogleGenAI | null {
@@ -44,6 +138,82 @@ app.get('/api/health', (_req: Request, res: Response) => {
     timestamp: Date.now(),
     agentEngine: hasKey ? 'connected' : 'ready (autonomous fallback)',
     githubIntegration: hasGithub ? 'authenticated' : 'public_ready',
+  });
+});
+
+// Workspace Persistence REST Endpoints
+app.get('/api/workspaces', (_req: Request, res: Response) => {
+  const store = readPersistedWorkspaces();
+  res.json({
+    success: true,
+    schemaVersion: store.schemaVersion,
+    lastSaved: store.lastSaved,
+    activeProjectId: store.activeProjectId,
+    workspaces: store.workspaces,
+  });
+});
+
+app.get('/api/workspaces/:id', (req: Request, res: Response) => {
+  const { id } = req.params;
+  const store = readPersistedWorkspaces();
+  const workspace = store.workspaces.find((w: any) => w.id === id);
+  if (!workspace) {
+    res.status(404).json({ success: false, error: `Workspace "${id}" not found.` });
+    return;
+  }
+  res.json({ success: true, workspace });
+});
+
+app.post('/api/workspaces', (req: Request, res: Response) => {
+  const { workspaces, workspace, activeProjectId } = req.body;
+  const store = readPersistedWorkspaces();
+
+  if (Array.isArray(workspaces)) {
+    store.workspaces = workspaces;
+  } else if (workspace && typeof workspace === 'object' && workspace.id) {
+    const existingIdx = store.workspaces.findIndex((w: any) => w.id === workspace.id);
+    if (existingIdx >= 0) {
+      store.workspaces[existingIdx] = workspace;
+    } else {
+      store.workspaces.unshift(workspace);
+    }
+  } else {
+    res.status(400).json({ success: false, error: 'Invalid payload: provide "workspaces" array or single "workspace" object.' });
+    return;
+  }
+
+  if (activeProjectId) {
+    store.activeProjectId = activeProjectId;
+  }
+
+  writePersistedWorkspaces(store);
+
+  res.json({
+    success: true,
+    schemaVersion: store.schemaVersion,
+    count: store.workspaces.length,
+    activeProjectId: store.activeProjectId,
+    lastSaved: Date.now(),
+  });
+});
+
+app.delete('/api/workspaces/:id', (req: Request, res: Response) => {
+  const { id } = req.params;
+  const store = readPersistedWorkspaces();
+  const beforeCount = store.workspaces.length;
+  store.workspaces = store.workspaces.filter((w: any) => w.id !== id);
+
+  if (store.activeProjectId === id) {
+    store.activeProjectId = store.workspaces[0]?.id || undefined;
+  }
+
+  writePersistedWorkspaces(store);
+
+  res.json({
+    success: true,
+    deleted: beforeCount !== store.workspaces.length,
+    remainingCount: store.workspaces.length,
+    activeProjectId: store.activeProjectId,
   });
 });
 
