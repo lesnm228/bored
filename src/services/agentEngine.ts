@@ -93,7 +93,21 @@ export class AutonomousAgentEngine {
     }).catch(() => undefined);
   }
 
-  private buildTaskManagerProjectFiles(projectName: string, projectId: string, instruction: string): ProjectFile[] {
+  private async persistWorkflow(project: ProjectConfig, workflowId: string, values: Record<string, unknown>): Promise<void> {
+    await fetch(`/api/workspaces/${encodeURIComponent(project.id)}/agent-context`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ context: {
+        workflowId,
+        instruction: project.description,
+        purpose: project.description,
+        framework: project.framework,
+        ...values,
+      } }),
+    }).catch(() => undefined);
+  }
+
+  private buildGeneralProjectFiles(projectName: string, projectId: string, instruction: string): ProjectFile[] {
     const safeName = projectName.trim() || 'Task Manager';
     const safeId = projectId.replace(/[^a-zA-Z0-9_-]/g, '-');
     const appName = safeName.replace(/[^a-zA-Z0-9 ]/g, '').trim() || 'Task Manager';
@@ -408,8 +422,8 @@ button, input { font: inherit; }
     project.updatedAt = Date.now();
     project.createdAt = Date.now();
 
-    const generatedFiles = this.buildTaskManagerProjectFiles(safeName, projectId, instruction);
-    project.files = generatedFiles;
+    const workflowId = `workflow-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    project.files = ProjectService.createProject({ name: safeName, description: instruction }).files;
     project.tasks = [];
     project.tests = [];
 
@@ -425,28 +439,61 @@ button, input { font: inherit; }
     persistedProjects = [project, ...persistedProjects.filter((p) => p.id !== project.id)];
     localStorage.setItem('builder_board_projects_v3', JSON.stringify(persistedProjects));
     localStorage.setItem('builder_board_active_proj_v3', project.id);
+    await ProjectService.saveSingleWorkspace(project);
 
+    await this.persistWorkflow(project, workflowId, { lifecycleStatus: 'planning', resumeEligible: false });
     const planRes = await fetch('/api/agent/plan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         goal: instruction,
         projectContext: `${project.name}: ${project.description}`,
-        files: generatedFiles.map((f) => ({ path: f.path, language: f.language })),
+        files: project.files.map((f) => ({ path: f.path, language: f.language })),
       }),
     });
     const planData = planRes.ok ? await planRes.json() : null;
     const plan = planData?.plan || {
       summary: `Real product plan for: ${instruction}`,
       estimatedSteps: 3,
-      tasks: [{ title: 'Generate app scaffold', description: instruction, priority: 'high', targetFiles: generatedFiles.map((f) => f.path), subtasks: ['Create files', 'Install dependencies', 'Validate build'] }],
+      tasks: [{ title: 'Generate app scaffold', description: instruction, priority: 'high', targetFiles: project.files.map((f) => f.path), subtasks: ['Create files', 'Install dependencies', 'Validate build'] }],
       reasoning: ['Real workspace created using Builder Board orchestrator.'],
     };
 
+    await this.persistWorkflow(project, workflowId, { lifecycleStatus: 'planning', plan, updatedAt: Date.now() });
+    const generatedFiles = [...project.files];
+    const plannedPaths: string[] = Array.from(new Set(plan.tasks.flatMap((task: any) => Array.isArray(task.targetFiles) ? task.targetFiles.filter((file: unknown): file is string => typeof file === 'string') : [])));
+    for (const filePath of plannedPaths) {
+      const current = generatedFiles.find((file) => file.path === filePath);
+      const stepRes = await fetch('/api/agent/execute-step', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          taskTitle: plan.tasks[0]?.title || 'Implement planned project',
+          taskDescription: plan.tasks[0]?.description || instruction,
+          filePath,
+          currentContent: current?.content || '',
+          goal: instruction,
+        }),
+      });
+      if (!stepRes.ok) throw new Error(`File generation failed for ${filePath}.`);
+      const stepData = await stepRes.json();
+      if (typeof stepData.content !== 'string') throw new Error(`File generation returned no content for ${filePath}.`);
+      const generated = current || { id: `f-${Date.now()}`, name: filePath.split('/').pop() || filePath, path: filePath, language: 'typescript' as const, content: '', lastModified: Date.now() };
+      generated.content = stepData.content;
+      generated.lastModified = Date.now();
+      const index = generatedFiles.findIndex((file) => file.path === filePath);
+      if (index >= 0) generatedFiles[index] = generated;
+      else generatedFiles.push(generated);
+    }
+    project.files = generatedFiles;
+    await this.persistWorkflow(project, workflowId, { lifecycleStatus: 'writing_code', importantFiles: generatedFiles.map((file) => file.path) });
+
     this.isRunning = true;
     this.abortController = new AbortController();
+    let workflowReady = false;
 
     try {
+      await this.persistWorkflow(project, workflowId, { lifecycleStatus: 'inspecting', affectedFiles: generatedFiles.map((file) => file.path) });
       const packageManagerRes = await fetch('/api/workspace/package-manager', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -460,6 +507,7 @@ button, input { font: inherit; }
       }
       const packageManagerData = await packageManagerRes.json();
       const packageManager = packageManagerData.manager || 'npm';
+      await this.persistWorkflow(project, workflowId, { lifecycleStatus: 'validating', currentCommand: `${packageManager} install` });
 
       const installResult = await TerminalService.executeAndWait({
         projectId,
@@ -489,8 +537,10 @@ button, input { font: inherit; }
           return { success: false, status: 'blocked', message: 'Aborted by user.' };
         }
         try {
-          const probe = await fetch(`http://127.0.0.1:${port}/`, { method: 'GET' });
-          if (probe.ok) {
+          const statusRes = await fetch(`/api/workspace/dev/status/${encodeURIComponent(projectId)}`);
+          const statusData = statusRes.ok ? await statusRes.json() : null;
+          const probe = await fetch(readyUrl, { method: 'GET' });
+          if (statusData?.status === 'running' && statusData.pid && probe.ok) {
             ready = true;
           }
         } catch {
@@ -500,6 +550,11 @@ button, input { font: inherit; }
       }
       if (!ready) {
         return { success: false, status: 'failed', message: 'Dev server did not become ready on the expected port.', details: { port, previewUrl: readyUrl } };
+      }
+
+      const previewProbe = await fetch(readyUrl, { method: 'GET' });
+      if (!previewProbe.ok) {
+        return { success: false, status: 'failed', message: 'Builder Board preview proxy did not respond successfully.', details: { previewUrl: readyUrl, status: previewProbe.status } };
       }
 
       const validationResults: Record<string, any> = {};
@@ -513,14 +568,14 @@ button, input { font: inherit; }
       }
       const packageInfo = await packageInfoRes.json();
       const availableScripts = packageInfo.scripts || {};
-      for (const command of ['typecheck', 'lint', 'test', 'build']) {
+      for (const command of ['typecheck', 'lint', 'test']) {
         if (!availableScripts[command]) {
           validationResults[command] = 'NOT CONFIGURED';
           continue;
         }
         const result = await TerminalService.executeAndWait({
           projectId,
-          command: `npm run ${command}`,
+          command: `${packageManager} run ${command}`,
           timeoutMs: 600000,
         });
         validationResults[command] = {
@@ -529,6 +584,12 @@ button, input { font: inherit; }
           durationMs: result.session.durationMs,
           events: result.session.events.slice(-20),
         };
+        await this.persistWorkflow(project, workflowId, {
+          lifecycleStatus: command === 'build' ? 'building' : 'validating',
+          currentCommand: `npm run ${command}`,
+          lastValidation: command === 'build' ? undefined : validationResults[command],
+          lastBuild: command === 'build' ? validationResults[command] : undefined,
+        });
         if (result.session.status !== 'completed' || result.session.exitCode !== 0) {
           let repairAttempts = 0;
           while (repairAttempts < maxRepairAttempts) {
@@ -536,7 +597,7 @@ button, input { font: inherit; }
             if (!repairTarget) break;
             const rerun = await TerminalService.executeAndWait({
               projectId,
-              command: `npm run ${command}`,
+              command: `${packageManager} run ${command}`,
               timeoutMs: 600000,
             });
             repairAttempts += 1;
@@ -546,6 +607,13 @@ button, input { font: inherit; }
               durationMs: rerun.session.durationMs,
               events: rerun.session.events.slice(-20),
             };
+            await this.persistWorkflow(project, workflowId, {
+              lifecycleStatus: 'self_correcting',
+              currentCommand: `npm run ${command}`,
+              repairAttempts,
+              lastValidation: command === 'build' ? undefined : validationResults[command],
+              lastBuild: command === 'build' ? validationResults[command] : undefined,
+            });
             if (rerun.session.status === 'completed' && rerun.session.exitCode === 0) {
               break;
             }
@@ -558,15 +626,25 @@ button, input { font: inherit; }
 
       const buildResult = await TerminalService.executeAndWait({
         projectId,
-        command: 'npm run build',
+        command: `${packageManager} run build`,
         timeoutMs: 600000,
       });
       if (buildResult.session.status !== 'completed' || buildResult.session.exitCode !== 0) {
         return { success: false, status: 'failed', message: 'Production build failed.', details: { buildResult } };
       }
+      await this.persistWorkflow(project, workflowId, {
+        lifecycleStatus: 'completed',
+        currentCommand: `${packageManager} run build`,
+        lastBuild: {
+          status: buildResult.session.status,
+          exitCode: buildResult.session.exitCode,
+          durationMs: buildResult.session.durationMs,
+        },
+      });
 
       const projectState = { ...project, updatedAt: Date.now(), files: generatedFiles };
       ProjectService.saveProjects([projectState, ...persistedProjects.filter((p) => p.id !== projectState.id)], projectId);
+      workflowReady = true;
 
       return {
         success: true,
@@ -585,6 +663,17 @@ button, input { font: inherit; }
         message: error?.message || 'Builder workflow failed unexpectedly.',
       };
     } finally {
+      if (!workflowReady) {
+        try {
+          await fetch('/api/workspace/dev/stop', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ projectId }),
+          });
+        } catch {
+          // The server owns process cleanup; this is best effort if disconnected.
+        }
+      }
       this.isRunning = false;
       this.abortController = null;
     }

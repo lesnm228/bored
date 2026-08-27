@@ -40,6 +40,7 @@ interface PersistedStore {
 function sanitizeAgentContext(context: any): any {
   if (!context || typeof context !== 'object') return {};
   const allowed = {
+    workflowId: typeof context.workflowId === 'string' ? context.workflowId.slice(0, 120) : '',
     purpose: typeof context.purpose === 'string' ? context.purpose.slice(0, 2000) : '',
     framework: typeof context.framework === 'string' ? context.framework.slice(0, 200) : '',
     instruction: typeof context.instruction === 'string' ? context.instruction.slice(0, 4000) : '',
@@ -72,6 +73,14 @@ function sanitizeAgentContext(context: any): any {
     importantFiles: Array.isArray(context.importantFiles) ? context.importantFiles.filter((item: any) => typeof item === 'string').slice(-100) : [],
     latestWorkingState: typeof context.latestWorkingState === 'string' ? context.latestWorkingState.slice(0, 2000) : '',
     currentBlocker: typeof context.currentBlocker === 'string' ? context.currentBlocker.slice(0, 2000) : '',
+    currentCommand: typeof context.currentCommand === 'string' ? context.currentCommand.slice(0, 200) : '',
+    repairAttempts: Number.isInteger(context.repairAttempts) ? context.repairAttempts : 0,
+    runtime: context.runtime && typeof context.runtime === 'object' ? {
+      status: typeof context.runtime.status === 'string' ? context.runtime.status.slice(0, 40) : '',
+      pid: typeof context.runtime.pid === 'number' ? context.runtime.pid : undefined,
+      port: typeof context.runtime.port === 'number' ? context.runtime.port : undefined,
+      previewUrl: typeof context.runtime.previewUrl === 'string' ? context.runtime.previewUrl.slice(0, 500) : '',
+    } : undefined,
     lastSuccessfulBuild: typeof context.lastSuccessfulBuild === 'number' ? context.lastSuccessfulBuild : undefined,
     recentTaskHistory: Array.isArray(context.recentTaskHistory) ? context.recentTaskHistory.slice(-20).map((item: any) => ({
       title: typeof item.title === 'string' ? item.title.slice(0, 500) : '',
