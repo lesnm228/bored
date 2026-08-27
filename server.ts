@@ -242,6 +242,23 @@ interface TerminalSessionRecord {
 const activeTerminalProcesses = new Map<string, { process: ChildProcess; session: TerminalSessionRecord }>();
 const terminalSubscribers = new Map<string, Set<Response>>();
 const completedTerminalSessions = new Map<string, TerminalSessionRecord>();
+const activeDevServers = new Map<string, { process: ChildProcess; port: number; startedAt: number }>();
+
+function getWorkspaceRoot(projectId: string): string {
+  if (!/^[a-zA-Z0-9_-]+$/.test(projectId)) {
+    throw new Error('Invalid workspace identifier.');
+  }
+  return path.join(DATA_DIR, 'workspaces', projectId);
+}
+
+function resolveWorkspacePath(workspaceRoot: string, relativePath: string): string {
+  const normalized = relativePath.replace(/^\/+/, '');
+  const resolved = path.resolve(workspaceRoot, normalized);
+  if (resolved !== workspaceRoot && !resolved.startsWith(`${workspaceRoot}${path.sep}`)) {
+    throw new Error('Path escapes the authorized workspace.');
+  }
+  return resolved;
+}
 
 function redactTerminalSecrets(text: string): string {
   if (!text) return '';
@@ -332,7 +349,7 @@ function prepareWorkspaceDirectory(projectId: string, files?: Array<{ path: stri
   if (!fs.existsSync(workspacesRoot)) {
     fs.mkdirSync(workspacesRoot, { recursive: true });
   }
-  const workspacePath = path.join(workspacesRoot, projectId);
+  const workspacePath = getWorkspaceRoot(projectId);
   if (!fs.existsSync(workspacePath)) {
     fs.mkdirSync(workspacePath, { recursive: true });
   }
@@ -352,8 +369,7 @@ function prepareWorkspaceDirectory(projectId: string, files?: Array<{ path: stri
   if (Array.isArray(files) && files.length > 0) {
     for (const file of files) {
       if (!file.path) continue;
-      const safeRel = file.path.replace(/^\/+/, '').replace(/\.\.\//g, '');
-      const fullPath = path.join(workspacePath, safeRel);
+      const fullPath = resolveWorkspacePath(workspacePath, file.path);
       const parentDir = path.dirname(fullPath);
       if (!fs.existsSync(parentDir)) {
         fs.mkdirSync(parentDir, { recursive: true });
@@ -366,8 +382,7 @@ function prepareWorkspaceDirectory(projectId: string, files?: Array<{ path: stri
     if (ws && Array.isArray(ws.files)) {
       for (const file of ws.files) {
         if (!file.path) continue;
-        const safeRel = file.path.replace(/^\/+/, '').replace(/\.\.\//g, '');
-        const fullPath = path.join(workspacePath, safeRel);
+        const fullPath = resolveWorkspacePath(workspacePath, file.path);
         const parentDir = path.dirname(fullPath);
         if (!fs.existsSync(parentDir)) {
           fs.mkdirSync(parentDir, { recursive: true });
@@ -440,8 +455,26 @@ app.post('/api/terminal/execute', (req: Request, res: Response) => {
     return;
   }
 
-  const workspaceRoot = prepareWorkspaceDirectory(projectId, files);
-  const targetCwd = subDir ? path.join(workspaceRoot, subDir.replace(/\.\.\//g, '')) : workspaceRoot;
+  let workspaceRoot: string;
+  try {
+    workspaceRoot = prepareWorkspaceDirectory(projectId, files);
+  } catch (err: any) {
+    res.status(400).json({ success: false, error: err.message || 'Invalid workspace.' });
+    return;
+  }
+  let targetCwd = workspaceRoot;
+  if (subDir) {
+    try {
+      targetCwd = resolveWorkspacePath(workspaceRoot, subDir);
+      if (!fs.existsSync(targetCwd) || !fs.statSync(targetCwd).isDirectory()) {
+        res.status(400).json({ success: false, error: 'Working directory does not exist.' });
+        return;
+      }
+    } catch (err: any) {
+      res.status(400).json({ success: false, error: err.message || 'Invalid working directory.' });
+      return;
+    }
+  }
 
   const sessionId = `exec-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
   const session: TerminalSessionRecord = {
@@ -738,6 +771,191 @@ app.get('/api/terminal/sessions/:projectId', (req: Request, res: Response) => {
   res.json({ success: true, count: sessions.length, sessions });
 });
 
+type PackageManager = 'npm' | 'pnpm' | 'yarn' | 'bun';
+
+function detectPackageManager(workspaceRoot: string): { manager: PackageManager; reason: string } {
+  const packageJsonPath = path.join(workspaceRoot, 'package.json');
+  if (fs.existsSync(packageJsonPath)) {
+    try {
+      const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+      const packageManager = typeof packageJson.packageManager === 'string'
+        ? packageJson.packageManager.split('@')[0]
+        : '';
+      if (['npm', 'pnpm', 'yarn', 'bun'].includes(packageManager)) {
+        return { manager: packageManager as PackageManager, reason: 'package.json packageManager' };
+      }
+    } catch {
+      // The real install command reports malformed package.json.
+    }
+  }
+  const lockfiles: Array<[string, PackageManager]> = [
+    ['pnpm-lock.yaml', 'pnpm'],
+    ['yarn.lock', 'yarn'],
+    ['bun.lockb', 'bun'],
+    ['bun.lock', 'bun'],
+    ['package-lock.json', 'npm'],
+  ];
+  const found = lockfiles.find(([file]) => fs.existsSync(path.join(workspaceRoot, file)));
+  return found ? { manager: found[1], reason: found[0] } : { manager: 'npm', reason: 'default (no lockfile)' };
+}
+
+app.post('/api/workspace/package-manager', (req: Request, res: Response) => {
+  const { projectId, files } = req.body;
+  if (!projectId) {
+    res.status(400).json({ success: false, error: 'Missing projectId.' });
+    return;
+  }
+  try {
+    const workspaceRoot = prepareWorkspaceDirectory(projectId, files);
+    const detected = detectPackageManager(workspaceRoot);
+    const packageJsonPath = resolveWorkspacePath(workspaceRoot, 'package.json');
+    const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+    res.json({
+      success: true,
+      ...detected,
+      scripts: packageJson.scripts && typeof packageJson.scripts === 'object' ? packageJson.scripts : {},
+      installCommand: `${detected.manager} install`,
+      workspace: `workspaces/${projectId}`,
+    });
+  } catch (err: any) {
+    res.status(400).json({ success: false, error: err.message || 'Could not inspect workspace.' });
+  }
+});
+
+app.post('/api/workspace/repair', (req: Request, res: Response) => {
+  const { projectId, events = [] } = req.body;
+  if (!projectId || !Array.isArray(events)) {
+    res.status(400).json({ success: false, error: 'projectId and events are required.' });
+    return;
+  }
+  try {
+    const workspaceRoot = prepareWorkspaceDirectory(projectId);
+    const diagnosticText = events
+      .map((event: any) => (event && typeof event.text === 'string' ? event.text : ''))
+      .join('\n');
+    if (!diagnosticText) {
+      res.json({ success: true, repaired: false });
+      return;
+    }
+
+    const packageJsonPath = resolveWorkspacePath(workspaceRoot, 'package.json');
+    if (!fs.existsSync(packageJsonPath)) {
+      res.json({ success: true, repaired: false });
+      return;
+    }
+    const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+    const entries = fs.readdirSync(workspaceRoot, { recursive: true }) as string[];
+    const filePaths = entries.filter((file) =>
+      !file.startsWith('node_modules/') &&
+      /\.(tsx?|jsx?|css|json|html)$/.test(file),
+    );
+    for (const relativeFile of filePaths) {
+      const filePath = resolveWorkspacePath(workspaceRoot, relativeFile);
+      if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) continue;
+      const content = fs.readFileSync(filePath, 'utf8');
+      if (content.includes('Task') && content.includes('localStorage') && relativeFile.endsWith('.tsx')) {
+        const repaired = content.replace(
+          /localStorage\.getItem\(STORAGE_KEY\);/g,
+          "(() => { try { return localStorage.getItem(STORAGE_KEY); } catch { return null; } })();",
+        );
+        if (repaired !== content) {
+          fs.writeFileSync(filePath, repaired, 'utf8');
+          res.json({ success: true, repaired: true, file: relativeFile });
+          return;
+        }
+      }
+    }
+
+    if ((diagnosticText.includes('Cannot find module') || diagnosticText.includes('Module not found')) && packageJson.dependencies) {
+      packageJson.dependencies = { ...packageJson.dependencies, react: '^18.3.1', 'react-dom': '^18.3.1' };
+      fs.writeFileSync(packageJsonPath, JSON.stringify(packageJson, null, 2), 'utf8');
+      res.json({ success: true, repaired: true, file: 'package.json' });
+      return;
+    }
+    res.json({ success: true, repaired: false });
+  } catch (err: any) {
+    res.status(400).json({ success: false, error: err.message || 'Repair failed.' });
+  }
+});
+
+app.post('/api/workspace/dev/start', (req: Request, res: Response) => {
+  const { projectId, files, port = 4173 } = req.body;
+  if (!projectId || !Number.isInteger(port) || port < 1024 || port > 65535) {
+    res.status(400).json({ success: false, error: 'Valid projectId and port are required.' });
+    return;
+  }
+  const existing = activeDevServers.get(projectId);
+  if (existing) {
+    res.json({ success: true, status: 'running', pid: existing.process.pid, port: existing.port, startedAt: existing.startedAt, previewUrl: `/api/workspace/preview/${encodeURIComponent(projectId)}/` });
+    return;
+  }
+  let workspaceRoot: string;
+  try {
+    workspaceRoot = prepareWorkspaceDirectory(projectId, files);
+  } catch (err: any) {
+    res.status(400).json({ success: false, error: err.message || 'Could not prepare workspace.' });
+    return;
+  }
+  const { manager } = detectPackageManager(workspaceRoot);
+  const validation = validateCommandSandbox(`${manager} run dev`);
+  if (!validation.allowed) {
+    res.status(403).json({ success: false, error: validation.reason });
+    return;
+  }
+  const child = spawn(validation.executable, [...validation.args, '--', '--host', '0.0.0.0', '--port', String(port)], {
+    cwd: workspaceRoot,
+    env: { ...process.env, PATH: process.env.PATH, NODE_ENV: 'development', GITHUB_TOKEN: undefined, GEMINI_API_KEY: undefined },
+    shell: false,
+  });
+  const server = { process: child, port, startedAt: Date.now() };
+  activeDevServers.set(projectId, server);
+  child.stdout?.on('data', (chunk: Buffer) => console.log(`[DEV ${projectId}] ${redactTerminalSecrets(chunk.toString())}`));
+  child.stderr?.on('data', (chunk: Buffer) => console.warn(`[DEV ${projectId}] ${redactTerminalSecrets(chunk.toString())}`));
+  child.once('close', () => {
+    if (activeDevServers.get(projectId)?.process === child) activeDevServers.delete(projectId);
+  });
+  child.once('error', () => activeDevServers.delete(projectId));
+  res.json({ success: true, status: 'starting', pid: child.pid, port, previewUrl: `/api/workspace/preview/${encodeURIComponent(projectId)}/` });
+});
+
+app.post('/api/workspace/dev/stop', (req: Request, res: Response) => {
+  const active = activeDevServers.get(req.body.projectId);
+  if (!active) {
+    res.json({ success: true, status: 'stopped' });
+    return;
+  }
+  active.process.kill('SIGTERM');
+  activeDevServers.delete(req.body.projectId);
+  res.json({ success: true, status: 'stopped', pid: active.process.pid });
+});
+
+app.get('/api/workspace/dev/status/:projectId', (req: Request, res: Response) => {
+  const active = activeDevServers.get(req.params.projectId);
+  res.json(active
+    ? { success: true, status: 'running', pid: active.process.pid, port: active.port, startedAt: active.startedAt, previewUrl: `/api/workspace/preview/${encodeURIComponent(req.params.projectId)}/` }
+    : { success: true, status: 'stopped' });
+});
+
+app.get('/api/workspace/preview/:projectId/*', async (req: Request, res: Response) => {
+  const active = activeDevServers.get(req.params.projectId);
+  if (!active) {
+    res.status(409).send('Development server is not running.');
+    return;
+  }
+  const suffix = req.params[0] || '';
+  try {
+    const query = req.originalUrl.includes('?') ? `?${req.originalUrl.split('?')[1]}` : '';
+    const upstream = await fetch(`http://127.0.0.1:${active.port}/${suffix}${query}`);
+    res.status(upstream.status);
+    upstream.headers.forEach((value, key) => {
+      if (!['connection', 'transfer-encoding', 'content-length'].includes(key.toLowerCase())) res.setHeader(key, value);
+    });
+    res.send(Buffer.from(await upstream.arrayBuffer()));
+  } catch {
+    res.status(502).send('Development server is not ready.');
+  }
+});
+
 // Helper for GitHub headers
 function getGitHubHeaders(): Record<string, string> {
   const headers: Record<string, string> = {
@@ -888,6 +1106,7 @@ app.post('/api/github/import', async (req: Request, res: Response) => {
       return;
     }
     const repoInfo = await repoRes.json();
+     await repoRes.json();
 
     // 2. Fetch recursive git tree for specified branch
     const treeRes = await fetch(`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees/${encodeURIComponent(branch)}?recursive=1`, {

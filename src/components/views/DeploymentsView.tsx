@@ -17,14 +17,18 @@ import { ProjectConfig, DeploymentRecord } from '../../types';
 
 interface DeploymentsViewProps {
   currentProject: ProjectConfig;
+  previewState?: { status: 'stopped' | 'starting' | 'running' | 'failed'; port?: number; previewUrl?: string; pid?: number };
   onDeploy: (environment: 'production' | 'staging' | 'preview') => void;
   onRollback: (deploymentId: string) => void;
+  onTogglePreview: () => void;
 }
 
 export const DeploymentsView: React.FC<DeploymentsViewProps> = ({
   currentProject,
+  previewState,
   onDeploy,
   onRollback,
+  onTogglePreview,
 }) => {
   const [selectedEnv, setSelectedEnv] = useState<'production' | 'staging' | 'preview'>('staging');
   const [isDeploying, setIsDeploying] = useState(false);
@@ -111,6 +115,40 @@ export const DeploymentsView: React.FC<DeploymentsViewProps> = ({
             <Play className="w-3.5 h-3.5 fill-slate-950" />
             <span>Release to Production</span>
           </button>
+        </div>
+      </div>
+
+      <div className="mt-6 rounded-2xl bg-[#0a101f]/80 border border-blue-900/50 overflow-hidden">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-blue-900/40 bg-[#030816]">
+          <div className="flex items-center gap-2 text-sm font-bold text-slate-100 uppercase tracking-wider">
+            <Server className="w-4 h-4 text-amber-400" />
+            <span>Live Preview</span>
+          </div>
+          <button
+            onClick={onTogglePreview}
+            className="px-3 py-1.5 rounded-lg border border-blue-900/60 bg-[#0a101f] text-xs font-semibold text-blue-300 hover:text-amber-300"
+          >
+            {previewState?.status === 'running' ? 'Stop Preview' : previewState?.status === 'starting' ? 'Starting...' : 'Start Preview'}
+          </button>
+        </div>
+
+        <div className="h-[420px] bg-[#020617]">
+          {previewState?.status === 'running' && previewState.previewUrl ? (
+            <iframe
+              title={`${currentProject.name} live preview`}
+              src={previewState.previewUrl}
+              className="w-full h-full border-0 bg-white"
+              sandbox="allow-scripts allow-forms allow-popups allow-modals"
+            />
+          ) : (
+            <div className="flex h-full items-center justify-center text-sm text-slate-400">
+              {previewState?.status === 'starting'
+                ? 'Preview starting…'
+                : previewState?.status === 'failed'
+                ? 'Preview failed to start.'
+                : 'No live preview is running for this project.'}
+            </div>
+          )}
         </div>
       </div>
 

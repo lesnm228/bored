@@ -47,6 +47,12 @@ export default function App() {
   const [agentState, setAgentState] = useState(globalAgentEngine.getState());
   const [activeTerminalSession, setActiveTerminalSession] = useState<TerminalSession | null>(null);
   const [isExecutingCommand, setIsExecutingCommand] = useState(false);
+  const [previewState, setPreviewState] = useState<{
+    status: 'stopped' | 'starting' | 'running' | 'failed';
+    port?: number;
+    previewUrl?: string;
+    pid?: number;
+  }>({ status: 'stopped' });
   const activeCancelRef = useRef<(() => Promise<boolean>) | null>(null);
 
   // Save to persistent storage when state changes
@@ -85,6 +91,36 @@ export default function App() {
     });
     return unsub;
   }, []);
+
+  useEffect(() => {
+    if (!currentProjectId) return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const res = await fetch(`/api/workspace/dev/status/${encodeURIComponent(currentProjectId)}`);
+        const data = await res.json();
+        if (cancelled) return;
+        if (data?.success) {
+          setPreviewState({
+            status: data.status,
+            port: data.port,
+            previewUrl: data.previewUrl,
+            pid: data.pid,
+          });
+        }
+      } catch {
+        if (!cancelled) {
+          setPreviewState({ status: 'stopped' });
+        }
+      }
+    };
+    void poll();
+    const interval = window.setInterval(() => { void poll(); }, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [currentProjectId]);
 
   const currentProject =
     projects.find((p) => p.id === currentProjectId) || projects[0];
@@ -182,6 +218,48 @@ export default function App() {
   const handleAbortAgent = () => {
     globalAgentEngine.abort();
     appendLog('Agent execution forcibly aborted by operator.', 'warn', 'OPERATOR');
+  };
+
+  const handleTogglePreview = async () => {
+    try {
+      if (previewState.status === 'running') {
+        const res = await fetch('/api/workspace/dev/stop', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ projectId: currentProject.id }),
+        });
+        if (res.ok) {
+          setPreviewState({ status: 'stopped' });
+          appendLog(`Stopped live preview for project "${currentProject.name}".`, 'warn', 'PREVIEW');
+        }
+        return;
+      }
+      const res = await fetch('/api/workspace/dev/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          projectId: currentProject.id,
+          files: currentProject.files,
+          port: 4173,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data?.success) {
+        appendLog(data?.error || 'Preview start failed.', 'error', 'PREVIEW');
+        setPreviewState({ status: 'failed' });
+        return;
+      }
+      setPreviewState({
+        status: data.status,
+        port: data.port,
+        previewUrl: data.previewUrl,
+        pid: data.pid,
+      });
+      appendLog(`Started live preview for project "${currentProject.name}" on port ${data.port}.`, 'success', 'PREVIEW');
+    } catch (err: any) {
+      setPreviewState({ status: 'failed' });
+      appendLog(`Preview could not start: ${err?.message || 'Unknown error'}`, 'error', 'PREVIEW');
+    }
   };
 
   // File operations
@@ -687,8 +765,10 @@ export default function App() {
           {currentView === 'deployments' && (
             <DeploymentsView
               currentProject={currentProject}
+              previewState={previewState}
               onDeploy={handleDeploy}
               onRollback={handleRollback}
+              onTogglePreview={handleTogglePreview}
             />
           )}
 

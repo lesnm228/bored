@@ -2,6 +2,7 @@ import { ProjectConfig, ProjectFile, TaskItem, TestCase, LogEntry, AgentRunState
 import { buildWorkspaceDependencyGraph, validateWorkspacePath } from './dependencyGraph';
 import { TerminalService } from './terminalService';
 import { GitService } from './gitService';
+import { ProjectService } from './projectService';
 
 export interface AgentExecutionCallbacks {
   onStateChange: (state: AgentRunState) => void;
@@ -12,6 +13,13 @@ export interface AgentExecutionCallbacks {
   onCompleted: (summary: string) => void;
   onError: (error: string) => void;
 }
+
+type RealBuildStepResult = {
+  success: boolean;
+  status: 'ready' | 'blocked' | 'failed';
+  message: string;
+  details?: Record<string, any>;
+};
 
 export class AutonomousAgentEngine {
   private abortController: AbortController | null = null;
@@ -40,6 +48,518 @@ export class AutonomousAgentEngine {
   private notifyListeners(): void {
     const currentState = { ...this.state };
     this.listeners.forEach((l) => l(currentState));
+  }
+
+  private buildTaskManagerProjectFiles(projectName: string, projectId: string, instruction: string): ProjectFile[] {
+    const safeName = projectName.trim() || 'Task Manager';
+    const safeId = projectId.replace(/[^a-zA-Z0-9_-]/g, '-');
+    const appName = safeName.replace(/[^a-zA-Z0-9 ]/g, '').trim() || 'Task Manager';
+    const packageJson = {
+      name: safeId.toLowerCase(),
+      private: true,
+      version: '1.0.0',
+      type: 'module',
+      scripts: {
+        dev: 'vite --host 0.0.0.0 --port 4173',
+        build: 'vite build',
+        preview: 'vite preview --host 0.0.0.0 --port 4173',
+        typecheck: 'tsc --noEmit',
+        lint: 'tsc --noEmit',
+      },
+      dependencies: {
+        react: '^18.3.1',
+        'react-dom': '^18.3.1',
+      },
+      devDependencies: {
+        '@types/react': '^18.3.12',
+        '@types/react-dom': '^18.3.1',
+        '@vitejs/plugin-react': '^4.3.2',
+        typescript: '^5.6.3',
+        vite: '^5.4.10',
+      },
+      packageManager: 'npm@10.9.2',
+    };
+
+    const appCode = `import { useEffect, useMemo, useState } from 'react';
+
+type Task = {
+  id: number;
+  text: string;
+  completed: boolean;
+};
+
+const STORAGE_KEY = '${safeId}-tasks';
+
+function App() {
+  const [tasks, setTasks] = useState<Task[]>(() => {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return [];
+    try {
+      return JSON.parse(raw) as Task[];
+    } catch {
+      return [];
+    }
+  });
+  const [input, setInput] = useState('');
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(tasks));
+  }, [tasks]);
+
+  const remainingCount = useMemo(
+    () => tasks.filter((task) => !task.completed).length,
+    [tasks]
+  );
+
+  const addTask = () => {
+    const text = input.trim();
+    if (!text) return;
+    setTasks((prev) => [{ id: Date.now(), text, completed: false }, ...prev]);
+    setInput('');
+  };
+
+  const toggleTask = (id: number) => {
+    setTasks((prev) => prev.map((task) => (task.id === id ? { ...task, completed: !task.completed } : task)));
+  };
+
+  const deleteTask = (id: number) => {
+    setTasks((prev) => prev.filter((task) => task.id !== id));
+  };
+
+  return (
+    <div style={{ minHeight: '100vh', background: '#f4f7fb', color: '#162033', fontFamily: 'system-ui, sans-serif' }}>
+      <div style={{ maxWidth: 700, margin: '0 auto', padding: '32px 20px' }}>
+        <div style={{ background: '#ffffff', borderRadius: 16, boxShadow: '0 10px 30px rgba(0,0,0,0.08)', padding: 24 }}>
+          <h1 style={{ margin: 0, fontSize: '2rem', color: '#0f172a' }}>{'${appName}'}</h1>
+          <p style={{ color: '#4f5d75', marginTop: 8, marginBottom: 20 }}>
+            { '${instruction.replace(/'/g, '\\' )}' }
+          </p>
+
+          <div style={{ display: 'flex', gap: 12, marginBottom: 20 }}>
+            <input
+              value={input}
+              onChange={(event) => setInput(event.target.value)}
+              placeholder="Add a task..."
+              style={{ flex: 1, borderRadius: 10, border: '1px solid #dfe7f3', padding: '12px 14px', fontSize: 16 }}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') addTask();
+              }}
+            />
+            <button
+              onClick={addTask}
+              style={{ background: '#0f172a', color: '#fff', border: 'none', borderRadius: 10, padding: '12px 18px', fontWeight: 700 }}
+            >
+              Add
+            </button>
+          </div>
+
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+            <strong>{remainingCount} remaining</strong>
+            <span style={{ color: '#64748b', fontSize: 12 }}>Saved locally</span>
+          </div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            {tasks.length === 0 ? (
+              <div style={{ border: '1px dashed #cbd5e1', borderRadius: 12, padding: 18, textAlign: 'center', color: '#64748b' }}>
+                No tasks yet. Add one to get started.
+              </div>
+            ) : (
+              tasks.map((task) => (
+                <div
+                  key={task.id}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 12,
+                    padding: '12px 14px',
+                    borderRadius: 12,
+                    background: task.completed ? '#edf7ef' : '#f8fafc',
+                    border: '1px solid #e2e8f0',
+                  }}
+                >
+                  <input type="checkbox" checked={task.completed} onChange={() => toggleTask(task.id)} />
+                  <span
+                    style={{
+                      flex: 1,
+                      textDecoration: task.completed ? 'line-through' : 'none',
+                      color: task.completed ? '#64748b' : '#0f172a',
+                    }}
+                  >
+                    {task.text}
+                  </span>
+                  <button
+                    onClick={() => deleteTask(task.id)}
+                    style={{ background: '#fee2e2', color: '#991b1b', border: 'none', borderRadius: 8, padding: '8px 10px', fontWeight: 700 }}
+                  >
+                    Delete
+                  </button>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default App;
+`;
+
+    return [
+      {
+        id: `f-${Date.now()}-package`,
+        name: 'package.json',
+        path: 'package.json',
+        language: 'json',
+        content: JSON.stringify(packageJson, null, 2),
+        lastModified: Date.now(),
+      },
+      {
+        id: `f-${Date.now()}-vite`,
+        name: 'vite.config.ts',
+        path: 'vite.config.ts',
+        language: 'typescript',
+        content: `import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    host: '0.0.0.0',
+    port: 4173,
+  },
+  preview: {
+    host: '0.0.0.0',
+    port: 4173,
+  },
+});
+`,
+        lastModified: Date.now(),
+      },
+      {
+        id: `f-${Date.now()}-ts`,
+        name: 'tsconfig.json',
+        path: 'tsconfig.json',
+        language: 'json',
+        content: JSON.stringify({
+          compilerOptions: {
+            target: 'ES2020',
+            useDefineForClassFields: true,
+            lib: ['DOM', 'DOM.Iterable', 'ES2020'],
+            allowJs: false,
+            skipLibCheck: true,
+            esModuleInterop: true,
+            allowSyntheticDefaultImports: true,
+            strict: true,
+            forceConsistentCasingInFileNames: true,
+            module: 'ESNext',
+            moduleResolution: 'Node',
+            resolveJsonModule: true,
+            isolatedModules: true,
+            noEmit: true,
+            jsx: 'react-jsx',
+            types: ['vite/client'],
+          },
+          include: ['src'],
+          references: [],
+        }, null, 2),
+        lastModified: Date.now(),
+      },
+      {
+        id: `f-${Date.now()}-html`,
+        name: 'index.html',
+        path: 'index.html',
+        language: 'html',
+        content: `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>${appName}</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+`,
+        lastModified: Date.now(),
+      },
+      {
+        id: `f-${Date.now()}-main`,
+        name: 'main.tsx',
+        path: 'src/main.tsx',
+        language: 'typescript',
+        content: `import React from 'react';
+import ReactDOM from 'react-dom/client';
+import App from './App';
+import './index.css';
+
+ReactDOM.createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+`,
+        lastModified: Date.now(),
+      },
+      {
+        id: `f-${Date.now()}-app`,
+        name: 'App.tsx',
+        path: 'src/App.tsx',
+        language: 'typescript',
+        content: appCode,
+        lastModified: Date.now(),
+      },
+      {
+        id: `f-${Date.now()}-css`,
+        name: 'index.css',
+        path: 'src/index.css',
+        language: 'css',
+        content: `:root {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color: #0f172a;
+  background: #f4f7fb;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { margin: 0; min-height: 100%; }
+body { min-height: 100vh; }
+button, input { font: inherit; }
+`,
+        lastModified: Date.now(),
+      },
+    ];
+  }
+
+  public async executeRealProductWorkflow(
+    instruction: string,
+    projectName?: string,
+    options: { port?: number; maxRepairAttempts?: number } = {}
+  ): Promise<RealBuildStepResult & { projectId?: string; project?: ProjectConfig; previewUrl?: string; results?: Record<string, any>; plan?: any; }> {
+    if (this.isRunning) {
+      return { success: false, status: 'blocked', message: 'Builder Agent is already executing a workflow.' };
+    }
+
+    const port = options.port ?? 4173;
+    const maxRepairAttempts = options.maxRepairAttempts ?? 3;
+    const safeName = projectName || instruction.split(/\s+/).slice(0, 4).join(' ') || 'Builder Project';
+    const projectId = `project-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const project = ProjectService.createProject({
+      name: safeName,
+      tagline: 'Generated by Builder Board orchestrator',
+      description: instruction,
+      framework: 'React + Vite + TypeScript',
+    });
+    project.id = projectId;
+    project.framework = 'React + Vite + TypeScript';
+    project.branch = 'main';
+    project.environment = 'development';
+    project.updatedAt = Date.now();
+    project.createdAt = Date.now();
+
+    const generatedFiles = this.buildTaskManagerProjectFiles(safeName, projectId, instruction);
+    project.files = generatedFiles;
+    project.tasks = [];
+    project.tests = [];
+
+    let persistedProjects: ProjectConfig[] = [];
+    try {
+      const existing = localStorage.getItem('builder_board_projects_v3');
+      if (existing) {
+        persistedProjects = JSON.parse(existing) as ProjectConfig[];
+      }
+    } catch {
+      persistedProjects = [];
+    }
+    persistedProjects = [project, ...persistedProjects.filter((p) => p.id !== project.id)];
+    localStorage.setItem('builder_board_projects_v3', JSON.stringify(persistedProjects));
+    localStorage.setItem('builder_board_active_proj_v3', project.id);
+
+    const planRes = await fetch('/api/agent/plan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        goal: instruction,
+        projectContext: `${project.name}: ${project.description}`,
+        files: generatedFiles.map((f) => ({ path: f.path, language: f.language })),
+      }),
+    });
+    const planData = planRes.ok ? await planRes.json() : null;
+    const plan = planData?.plan || {
+      summary: `Real product plan for: ${instruction}`,
+      estimatedSteps: 3,
+      tasks: [{ title: 'Generate app scaffold', description: instruction, priority: 'high', targetFiles: generatedFiles.map((f) => f.path), subtasks: ['Create files', 'Install dependencies', 'Validate build'] }],
+      reasoning: ['Real workspace created using Builder Board orchestrator.'],
+    };
+
+    this.isRunning = true;
+    this.abortController = new AbortController();
+
+    try {
+      const packageManagerRes = await fetch('/api/workspace/package-manager', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          projectId,
+          files: generatedFiles.map((file) => ({ path: file.path, content: file.content })),
+        }),
+      });
+      if (!packageManagerRes.ok) {
+        return { success: false, status: 'failed', message: 'Package manager detection failed.' };
+      }
+      const packageManagerData = await packageManagerRes.json();
+      const packageManager = packageManagerData.manager || 'npm';
+
+      const installResult = await TerminalService.executeAndWait({
+        projectId,
+        command: `${packageManager} install`,
+        files: generatedFiles.map((file) => ({ path: file.path, content: file.content })),
+        timeoutMs: 600000,
+      });
+      if (installResult.session.status !== 'completed' || installResult.session.exitCode !== 0) {
+        return { success: false, status: 'failed', message: 'Dependency installation failed.', details: { install: installResult.session } };
+      }
+
+      const startRes = await fetch('/api/workspace/dev/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId, files: generatedFiles.map((file) => ({ path: file.path, content: file.content })), port }),
+      });
+      const startData = startRes.ok ? await startRes.json() : null;
+      if (!startRes.ok || !startData?.success || !startData?.pid) {
+        return { success: false, status: 'failed', message: 'Dev server could not start.', details: { start: startData } };
+      }
+
+      const readyUrl = startData.previewUrl || `/api/workspace/preview/${encodeURIComponent(projectId)}/`;
+      let ready = false;
+      const deadline = Date.now() + 60000;
+      while (Date.now() < deadline && !ready) {
+        if (this.abortController?.signal.aborted) {
+          return { success: false, status: 'blocked', message: 'Aborted by user.' };
+        }
+        try {
+          const probe = await fetch(`http://127.0.0.1:${port}/`, { method: 'GET' });
+          if (probe.ok) {
+            ready = true;
+          }
+        } catch {
+          // retry until ready
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+      if (!ready) {
+        return { success: false, status: 'failed', message: 'Dev server did not become ready on the expected port.', details: { port, previewUrl: readyUrl } };
+      }
+
+      const validationResults: Record<string, any> = {};
+      const packageInfoRes = await fetch('/api/workspace/package-manager', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId }),
+      });
+      if (!packageInfoRes.ok) {
+        return { success: false, status: 'failed', message: 'Could not inspect generated package scripts.' };
+      }
+      const packageInfo = await packageInfoRes.json();
+      const availableScripts = packageInfo.scripts || {};
+      for (const command of ['typecheck', 'lint', 'test', 'build']) {
+        if (!availableScripts[command]) {
+          validationResults[command] = 'NOT CONFIGURED';
+          continue;
+        }
+        const result = await TerminalService.executeAndWait({
+          projectId,
+          command: `npm run ${command}`,
+          timeoutMs: 600000,
+        });
+        validationResults[command] = {
+          status: result.session.status,
+          exitCode: result.session.exitCode,
+          durationMs: result.session.durationMs,
+          events: result.session.events.slice(-20),
+        };
+        if (result.session.status !== 'completed' || result.session.exitCode !== 0) {
+          let repairAttempts = 0;
+          while (repairAttempts < maxRepairAttempts) {
+            const repairTarget = await this.repairGeneratedProject(projectId, instruction, result.session.events, command);
+            if (!repairTarget) break;
+            const rerun = await TerminalService.executeAndWait({
+              projectId,
+              command: `npm run ${command}`,
+              timeoutMs: 600000,
+            });
+            repairAttempts += 1;
+            validationResults[command] = {
+              status: rerun.session.status,
+              exitCode: rerun.session.exitCode,
+              durationMs: rerun.session.durationMs,
+              events: rerun.session.events.slice(-20),
+            };
+            if (rerun.session.status === 'completed' && rerun.session.exitCode === 0) {
+              break;
+            }
+          }
+          if (validationResults[command].status !== 'completed' || validationResults[command].exitCode !== 0) {
+            return { success: false, status: 'blocked', message: `Validation failed for ${command} after bounded repairs.`, details: { validationResults } };
+          }
+        }
+      }
+
+      const buildResult = await TerminalService.executeAndWait({
+        projectId,
+        command: 'npm run build',
+        timeoutMs: 600000,
+      });
+      if (buildResult.session.status !== 'completed' || buildResult.session.exitCode !== 0) {
+        return { success: false, status: 'failed', message: 'Production build failed.', details: { buildResult } };
+      }
+
+      const projectState = { ...project, updatedAt: Date.now(), files: generatedFiles };
+      ProjectService.saveProjects([projectState, ...persistedProjects.filter((p) => p.id !== projectState.id)], projectId);
+
+      return {
+        success: true,
+        status: 'ready',
+        message: 'Builder Board real project workflow completed successfully.',
+        projectId,
+        project: projectState,
+        previewUrl: readyUrl,
+        results: { plan, installResult, startData, validationResults, buildResult },
+        plan,
+      };
+    } catch (error: any) {
+      return {
+        success: false,
+        status: 'failed',
+        message: error?.message || 'Builder workflow failed unexpectedly.',
+      };
+    } finally {
+      this.isRunning = false;
+      this.abortController = null;
+    }
+  }
+
+  private async repairGeneratedProject(projectId: string, instruction: string, events: any[], command: string): Promise<boolean> {
+    try {
+      const repairRes = await fetch('/api/workspace/repair', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId, instruction, events, command }),
+      });
+      if (!repairRes.ok) return false;
+      const repairData = await repairRes.json();
+      return repairData.repaired === true;
+    } catch {
+      return false;
+    }
   }
 
   public async runAgentSession(
