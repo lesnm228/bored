@@ -48,6 +48,7 @@ export default function App() {
   const [activeTerminalSession, setActiveTerminalSession] = useState<TerminalSession | null>(null);
   const [isExecutingCommand, setIsExecutingCommand] = useState(false);
   const activeCancelRef = useRef<(() => Promise<boolean>) | null>(null);
+  const [runtime, setRuntime] = useState<{ state: string; port?: number; sessionId?: string } | null>(null);
 
   // Save to persistent storage when state changes
   useEffect(() => {
@@ -570,6 +571,33 @@ export default function App() {
     setIsExecutingCommand(false);
   };
 
+  const handleStartRuntime = async () => {
+    setRuntime({ state: 'STARTING' });
+    appendLog('Starting the generated project dev server...', 'info', 'RUNTIME');
+    try {
+      const res = await fetch('/api/runtime/dev/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId: currentProject.id, files: currentProject.files }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Dev server failed to start.');
+      setRuntime(data.runtime);
+      appendLog(`HTTP readiness passed on port ${data.runtime.port}. Real preview is available.`, 'success', 'RUNTIME');
+    } catch (error: any) {
+      setRuntime({ state: 'FAILED' });
+      appendLog(`Generated project failed to start: ${error.message}`, 'error', 'RUNTIME');
+    }
+  };
+
+  const handleStopRuntime = async () => {
+    const res = await fetch(`/api/runtime/dev/stop/${encodeURIComponent(currentProject.id)}`, { method: 'POST' });
+    if (res.ok) {
+      setRuntime({ state: 'STOPPED' });
+      appendLog('Generated project dev server stopped.', 'info', 'RUNTIME');
+    }
+  };
+
   // Render Landing Page if selected
   if (currentView === 'landing') {
     return (
@@ -689,6 +717,9 @@ export default function App() {
               currentProject={currentProject}
               onDeploy={handleDeploy}
               onRollback={handleRollback}
+              runtime={runtime}
+              onStartRuntime={handleStartRuntime}
+              onStopRuntime={handleStopRuntime}
             />
           )}
 

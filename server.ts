@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import vm from 'node:vm';
 import { spawn, ChildProcess } from 'node:child_process';
+import { Readable } from 'node:stream';
 import * as esbuild from 'esbuild';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
@@ -243,6 +244,21 @@ const activeTerminalProcesses = new Map<string, { process: ChildProcess; session
 const terminalSubscribers = new Map<string, Set<Response>>();
 const completedTerminalSessions = new Map<string, TerminalSessionRecord>();
 
+type RuntimeState = 'STARTING' | 'RUNNING' | 'FAILED' | 'STOPPED';
+interface RuntimeDevRecord {
+  projectId: string;
+  sessionId: string;
+  process: ChildProcess;
+  pid?: number;
+  port: number;
+  startedAt: number;
+  state: RuntimeState;
+  error?: string;
+}
+
+const runtimeDevProcesses = new Map<string, RuntimeDevRecord>();
+const runtimePorts = new Map<number, string>();
+
 function redactTerminalSecrets(text: string): string {
   if (!text) return '';
   let sanitized = text;
@@ -326,7 +342,7 @@ function validateCommandSandbox(commandStr: string, requestedDir?: string): {
   return { allowed: true, executable, args };
 }
 
-function prepareWorkspaceDirectory(projectId: string, files?: Array<{ path: string; content: string }>): string {
+function prepareWorkspaceDirectory(projectId: string, files?: Array<{ path: string; content: string }>, syncPersisted = true): string {
   ensureDataDir();
   const workspacesRoot = path.join(DATA_DIR, 'workspaces');
   if (!fs.existsSync(workspacesRoot)) {
@@ -360,7 +376,7 @@ function prepareWorkspaceDirectory(projectId: string, files?: Array<{ path: stri
       }
       fs.writeFileSync(fullPath, file.content || '', 'utf-8');
     }
-  } else {
+  } else if (syncPersisted) {
     const store = readPersistedWorkspaces();
     const ws = store.workspaces.find((w: any) => w.id === projectId);
     if (ws && Array.isArray(ws.files)) {
@@ -410,6 +426,191 @@ function prepareWorkspaceDirectory(projectId: string, files?: Array<{ path: stri
 
   return workspacePath;
 }
+
+function assertProjectId(projectId: unknown): string {
+  if (typeof projectId !== 'string' || !/^[a-zA-Z0-9_-]{1,100}$/.test(projectId)) throw new Error('Invalid project ID.');
+  return projectId;
+}
+
+function resolveWorkspacePath(projectId: string, relativePath = ''): string {
+  const safeProjectId = assertProjectId(projectId);
+  const root = path.resolve(DATA_DIR, 'workspaces', safeProjectId);
+  const candidate = path.resolve(root, relativePath);
+  if (candidate !== root && !candidate.startsWith(`${root}${path.sep}`)) throw new Error('Path escapes the selected project workspace.');
+  if (fs.existsSync(candidate) && !fs.realpathSync(candidate).startsWith(`${root}${path.sep}`) && fs.realpathSync(candidate) !== root) throw new Error('Symlink escapes the selected project workspace.');
+  return candidate;
+}
+
+function materializeProjectWorkspace(projectId: string, files?: Array<{ path: string; content: string }>): string {
+  const workspace = path.resolve(prepareWorkspaceDirectory(assertProjectId(projectId), [], false));
+  for (const file of files || []) {
+    if (!file || typeof file.path !== 'string' || path.isAbsolute(file.path) || file.path.split(/[\\/]/).includes('..')) throw new Error(`Rejected unsafe project path: ${file?.path || 'unknown'}`);
+    const target = resolveWorkspacePath(projectId, file.path);
+    const parent = path.dirname(target);
+    fs.mkdirSync(parent, { recursive: true });
+    const realParent = fs.realpathSync(parent);
+    if (realParent !== workspace && !realParent.startsWith(`${workspace}${path.sep}`)) throw new Error(`Rejected symlinked project directory: ${file.path}`);
+    fs.writeFileSync(target, typeof file.content === 'string' ? file.content : '', 'utf-8');
+  }
+  return workspace;
+}
+
+function detectPackageManager(workspace: string): { name: 'bun' | 'pnpm' | 'yarn' | 'npm'; command: string; reason: string } {
+  const packageJsonPath = path.join(workspace, 'package.json');
+  let packageManager: string | undefined;
+  if (fs.existsSync(packageJsonPath)) {
+    try { packageManager = JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8')).packageManager; } catch { /* package validation happens before execution */ }
+  }
+  const managerFromField = packageManager?.split('@')[0];
+  if (managerFromField === 'bun' || fs.existsSync(path.join(workspace, 'bun.lock')) || fs.existsSync(path.join(workspace, 'bun.lockb'))) return { name: 'bun', command: 'bun', reason: packageManager ? 'packageManager field' : 'bun lockfile' };
+  if (managerFromField === 'pnpm' || fs.existsSync(path.join(workspace, 'pnpm-lock.yaml'))) return { name: 'pnpm', command: 'pnpm', reason: packageManager ? 'packageManager field' : 'pnpm lockfile' };
+  if (managerFromField === 'yarn' || fs.existsSync(path.join(workspace, 'yarn.lock'))) return { name: 'yarn', command: 'yarn', reason: packageManager ? 'packageManager field' : 'yarn lockfile' };
+  if (managerFromField === 'npm' || fs.existsSync(path.join(workspace, 'package-lock.json'))) return { name: 'npm', command: 'npm', reason: packageManager ? 'packageManager field' : 'npm lockfile' };
+  return { name: 'npm', command: 'npm', reason: 'no lockfile or packageManager field; npm fallback' };
+}
+
+function getConfiguredScript(workspace: string, script: unknown): { manager: ReturnType<typeof detectPackageManager>; script: string } {
+  const scriptName = String(script);
+  if (!['dev', 'build', 'lint', 'typecheck', 'test'].includes(scriptName)) throw new Error('Unsupported project command. Allowed scripts: dev, build, lint, typecheck, test.');
+  let pkg: any;
+  try { pkg = JSON.parse(fs.readFileSync(path.join(workspace, 'package.json'), 'utf-8')); } catch { throw new Error('Invalid or missing package.json.'); }
+  if (!pkg.scripts || typeof pkg.scripts[scriptName] !== 'string') throw new Error('NOT CONFIGURED');
+  return { manager: detectPackageManager(workspace), script: scriptName };
+}
+
+function allocateRuntimePort(projectId: string, requested?: number): number {
+  const existing = runtimeDevProcesses.get(projectId);
+  if (existing) return existing.port;
+  const start = Number.isInteger(requested) && requested! >= 1024 && requested! <= 65535 ? requested! : 4173;
+  for (let port = start; port < start + 100; port++) if (!runtimePorts.has(port)) { runtimePorts.set(port, projectId); return port; }
+  throw new Error('No managed runtime port is available.');
+}
+
+async function waitForHttpReady(port: number, timeoutMs = 15000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try { const response = await fetch(`http://127.0.0.1:${port}`, { signal: AbortSignal.timeout(500) }); if (response.status < 500) return; } catch { /* process is still starting */ }
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  throw new Error(`HTTP readiness check failed on port ${port}.`);
+}
+
+function spawnRuntimeSession(projectId: string, workspace: string, executable: string, args: string[], env: NodeJS.ProcessEnv): TerminalSessionRecord {
+  const sessionId = `runtime-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const session: TerminalSessionRecord = { id: sessionId, projectId, command: [executable, ...args].join(' '), workingDirectory: workspace, status: 'running', startedAt: Date.now(), events: [] };
+  const emit = (event: TerminalSessionRecord['events'][number] & { exitCode?: number | null; status?: TerminalSessionRecord['status'] }) => { session.events.push(event); broadcastTerminalEvent(sessionId, event); };
+  emit({ type: 'system', text: `[RUNTIME] Executing ${session.command}`, timestamp: Date.now() });
+  let child: ChildProcess;
+  try { child = spawn(executable, args, { cwd: workspace, env, shell: false, detached: process.platform !== 'win32' }); }
+  catch (error: any) { session.status = 'failed'; session.exitCode = 1; session.finishedAt = Date.now(); emit({ type: 'stderr', text: `Failed to spawn process: ${error.message}`, timestamp: Date.now() }); completedTerminalSessions.set(sessionId, session); return session; }
+  activeTerminalProcesses.set(sessionId, { process: child, session });
+  child.stdout?.on('data', (chunk: Buffer) => emit({ type: 'stdout', text: redactTerminalSecrets(chunk.toString()), timestamp: Date.now() }));
+  child.stderr?.on('data', (chunk: Buffer) => emit({ type: 'stderr', text: redactTerminalSecrets(chunk.toString()), timestamp: Date.now() }));
+  child.on('error', (error) => emit({ type: 'stderr', text: `[PROCESS ERROR] ${error.message}`, timestamp: Date.now() }));
+  child.on('close', (code) => {
+    activeTerminalProcesses.delete(sessionId);
+    session.status = session.status === 'cancelled' ? 'cancelled' : code === 0 ? 'completed' : 'failed';
+    session.exitCode = code;
+    session.finishedAt = Date.now();
+    session.durationMs = session.finishedAt - session.startedAt;
+    emit({ type: 'exit', text: `[PROCESS EXITED] Exit code ${code} (${session.status.toUpperCase()})`, timestamp: Date.now(), exitCode: code, status: session.status });
+    completedTerminalSessions.set(sessionId, session);
+  });
+  return session;
+}
+
+function safeRuntimeEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { NODE_ENV: 'development', PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR };
+  return env;
+}
+
+app.post('/api/runtime/prepare', (req: Request, res: Response) => {
+  try {
+    const projectId = assertProjectId(req.body.projectId);
+    const workspace = materializeProjectWorkspace(projectId, req.body.files);
+    const manager = detectPackageManager(workspace);
+    res.json({ success: true, projectId, workspace, packageManager: manager.name, detection: manager.reason });
+  } catch (error: any) { res.status(400).json({ success: false, error: error.message }); }
+});
+
+app.post('/api/runtime/install', (req: Request, res: Response) => {
+  try {
+    const projectId = assertProjectId(req.body.projectId);
+    const workspace = materializeProjectWorkspace(projectId, req.body.files);
+    const manager = detectPackageManager(workspace);
+    const session = spawnRuntimeSession(projectId, workspace, manager.command, ['install'], safeRuntimeEnv());
+    res.json({ success: true, projectId, packageManager: manager, session });
+  } catch (error: any) { res.status(400).json({ success: false, error: error.message }); }
+});
+
+app.post('/api/runtime/command', (req: Request, res: Response) => {
+  try {
+    const projectId = assertProjectId(req.body.projectId);
+    const workspace = materializeProjectWorkspace(projectId, req.body.files);
+    const configured = getConfiguredScript(workspace, req.body.script);
+    const session = spawnRuntimeSession(projectId, workspace, configured.manager.command, ['run', configured.script], safeRuntimeEnv());
+    res.json({ success: true, projectId, script: configured.script, packageManager: configured.manager, session });
+  } catch (error: any) { res.status(error.message === 'NOT CONFIGURED' ? 422 : 400).json({ success: false, error: error.message }); }
+});
+
+app.post('/api/runtime/dev/start', async (req: Request, res: Response) => {
+  try {
+    const projectId = assertProjectId(req.body.projectId);
+    const existing = runtimeDevProcesses.get(projectId);
+    if (existing && existing.state === 'RUNNING') { res.json({ success: true, runtime: { ...existing, process: undefined } }); return; }
+    const workspace = materializeProjectWorkspace(projectId, req.body.files);
+    const configured = getConfiguredScript(workspace, 'dev');
+    const port = allocateRuntimePort(projectId, req.body.port);
+    const env = { ...safeRuntimeEnv(), PORT: String(port) };
+    const session = spawnRuntimeSession(projectId, workspace, configured.manager.command, ['run', configured.script, '--', '--host', '127.0.0.1', '--port', String(port)], env);
+    const runtime: RuntimeDevRecord = { projectId, sessionId: session.id, process: activeTerminalProcesses.get(session.id)?.process || ({} as ChildProcess), pid: activeTerminalProcesses.get(session.id)?.process.pid, port, startedAt: Date.now(), state: 'STARTING' };
+    runtimeDevProcesses.set(projectId, runtime);
+    try {
+      await waitForHttpReady(port);
+      runtime.state = 'RUNNING';
+      res.json({ success: true, runtime: { ...runtime, process: undefined }, readiness: 'PASS' });
+    } catch (error: any) {
+      runtime.state = 'FAILED'; runtime.error = error.message;
+      res.status(502).json({ success: false, runtime: { ...runtime, process: undefined }, error: error.message });
+    }
+  } catch (error: any) { res.status(error.message === 'NOT CONFIGURED' ? 422 : 400).json({ success: false, error: error.message }); }
+});
+
+app.get('/api/runtime/dev/status/:projectId', (req: Request, res: Response) => {
+  try { const runtime = runtimeDevProcesses.get(assertProjectId(req.params.projectId)); res.json({ success: true, runtime: runtime ? { ...runtime, process: undefined } : null }); }
+  catch (error: any) { res.status(400).json({ success: false, error: error.message }); }
+});
+
+app.post('/api/runtime/dev/stop/:projectId', (req: Request, res: Response) => {
+  try {
+    const projectId = assertProjectId(req.params.projectId);
+    const runtime = runtimeDevProcesses.get(projectId);
+    if (!runtime) { res.json({ success: true, state: 'STOPPED', message: 'No running project server.' }); return; }
+    const active = activeTerminalProcesses.get(runtime.sessionId);
+    if (active) {
+      active.session.status = 'cancelled';
+      if (active.process.pid && process.platform !== 'win32') process.kill(-active.process.pid, 'SIGTERM'); else active.process.kill('SIGTERM');
+    }
+    runtime.state = 'STOPPED';
+    runtimePorts.delete(runtime.port);
+    runtimeDevProcesses.delete(projectId);
+    res.json({ success: true, state: 'STOPPED', projectId });
+  } catch (error: any) { res.status(400).json({ success: false, error: error.message }); }
+});
+
+app.get('/api/runtime/preview/:projectId/*', async (req: Request, res: Response) => {
+  try {
+    const projectId = assertProjectId(req.params.projectId);
+    const runtime = runtimeDevProcesses.get(projectId);
+    if (!runtime || runtime.state !== 'RUNNING') { res.status(503).json({ success: false, error: 'Project preview unavailable: dev server is not RUNNING.' }); return; }
+    const suffix = req.params[0] || '';
+    const upstream = await fetch(`http://127.0.0.1:${runtime.port}/${suffix}${req.url.includes('?') ? `?${req.url.split('?')[1]}` : ''}`);
+    res.status(upstream.status);
+    upstream.headers.forEach((value, key) => { if (key !== 'content-encoding') res.setHeader(key, value); });
+    if (upstream.body) Readable.fromWeb(upstream.body as any).pipe(res);
+    else res.end();
+  } catch (error: any) { res.status(502).json({ success: false, error: `Preview unavailable: ${error.message}` }); }
+});
 
 function broadcastTerminalEvent(sessionId: string, event: { type: 'stdout' | 'stderr' | 'system' | 'exit'; text: string; timestamp: number; [key: string]: any }) {
   const subscribers = terminalSubscribers.get(sessionId);

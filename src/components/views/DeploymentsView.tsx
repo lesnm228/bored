@@ -19,12 +19,18 @@ interface DeploymentsViewProps {
   currentProject: ProjectConfig;
   onDeploy: (environment: 'production' | 'staging' | 'preview') => void;
   onRollback: (deploymentId: string) => void;
+  runtime?: { state: string; port?: number; sessionId?: string } | null;
+  onStartRuntime?: () => void;
+  onStopRuntime?: () => void;
 }
 
 export const DeploymentsView: React.FC<DeploymentsViewProps> = ({
   currentProject,
   onDeploy,
   onRollback,
+  runtime,
+  onStartRuntime,
+  onStopRuntime,
 }) => {
   const [selectedEnv, setSelectedEnv] = useState<'production' | 'staging' | 'preview'>('staging');
   const [isDeploying, setIsDeploying] = useState(false);
@@ -42,11 +48,11 @@ export const DeploymentsView: React.FC<DeploymentsViewProps> = ({
       type: 'Local Workspace',
       url: 'http://localhost:3000',
       status: 'active',
-      version: 'v1.0.0 (Local)',
+      version: runtime?.port ? `Port ${runtime.port}` : 'Stopped',
       ssl: 'Local Loopback (Ingress)',
       region: 'localhost (Container)',
       trafficSplit: '100%',
-      configured: true,
+      configured: runtime?.state === 'RUNNING',
     },
     {
       id: 'staging',
@@ -154,7 +160,7 @@ export const DeploymentsView: React.FC<DeploymentsViewProps> = ({
               <div className="pt-2 border-t border-blue-900/40">
                 {env.configured ? (
                   <a
-                    href={env.url}
+                    href={env.id === 'local' && runtime?.state === 'RUNNING' ? `/api/runtime/preview/${currentProject.id}/` : env.url}
                     target="_blank"
                     rel="noreferrer"
                     className="text-[11px] text-blue-400 hover:text-amber-300 flex items-center gap-1 truncate font-mono"
@@ -168,6 +174,20 @@ export const DeploymentsView: React.FC<DeploymentsViewProps> = ({
                     <Globe className="w-3 h-3 shrink-0 text-slate-600" />
                     <span>Remote Target Not Connected</span>
                   </span>
+                )}
+                {env.id === 'local' && (
+                  <div className="flex items-center gap-2 mt-3">
+                    {runtime?.state === 'RUNNING' ? (
+                      <button onClick={onStopRuntime} className="text-[11px] text-red-300 hover:text-red-200 flex items-center gap-1" title="Stop generated project server">
+                        <Terminal className="w-3 h-3" /> Stop server
+                      </button>
+                    ) : (
+                      <button onClick={onStartRuntime} disabled={runtime?.state === 'STARTING'} className="text-[11px] text-emerald-300 hover:text-emerald-200 flex items-center gap-1 disabled:opacity-50" title="Start generated project server">
+                        <Play className="w-3 h-3" /> {runtime?.state === 'STARTING' ? 'Starting...' : 'Start server'}
+                      </button>
+                    )}
+                    {runtime?.state && <span className="text-[10px] font-mono text-slate-500">{runtime.state}</span>}
+                  </div>
                 )}
               </div>
             </div>
