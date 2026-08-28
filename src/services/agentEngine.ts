@@ -1,5 +1,6 @@
 import { ProjectConfig, ProjectFile, TaskItem, TestCase, LogEntry, AgentRunState, AutonomyLevel } from '../types';
 import { buildWorkspaceDependencyGraph, validateWorkspacePath } from './dependencyGraph';
+import { RuntimeService } from './runtimeService';
 
 export interface AgentExecutionCallbacks {
   onStateChange: (state: AgentRunState) => void;
@@ -14,6 +15,8 @@ export interface AgentExecutionCallbacks {
 export class AutonomousAgentEngine {
   private abortController: AbortController | null = null;
   private isRunning = false;
+  private activeRuntimeSessionIds = new Set<string>();
+  private activeProjectId: string | null = null;
   private state: AgentRunState = {
     status: 'idle',
     currentGoal: '',
@@ -108,6 +111,8 @@ export class AutonomousAgentEngine {
 
     this.isRunning = true;
     this.abortController = new AbortController();
+    this.activeProjectId = project.id;
+    this.activeRuntimeSessionIds.clear();
     const signal = this.abortController.signal;
 
     const runState: AgentRunState = {
@@ -505,6 +510,78 @@ export class AutonomousAgentEngine {
         addThought('Task Verified', `Task ${i + 1}/${planResult.tasks.length} passed cross-module validation and committed to workspace.`, 'verification');
       }
 
+      // The virtual checks above are advisory; READY requires the actual project runtime.
+      if (signal.aborted) throw new Error('Aborted by user');
+      runState.status = 'validating';
+      callbacks.onStateChange({ ...runState });
+      addThought('Runtime Preparation', 'Materializing generated files and detecting the project package manager...', 'action');
+      const prepared = await RuntimeService.prepare(project.id, workingFiles, signal);
+      const detectedManager = typeof prepared.packageManager === 'string' ? prepared.packageManager : prepared.packageManager?.name;
+      const detectionReason = typeof prepared.packageManager === 'string' ? prepared.detection : prepared.packageManager?.reason;
+      addThought('Package Manager', `Detected ${detectedManager || 'unknown'} (${detectionReason || 'runtime'})`, 'observation');
+
+      const installResponse = await RuntimeService.install(project.id, workingFiles, signal);
+      if (!installResponse.session) throw new Error('Dependency installation did not return a session.');
+      this.activeRuntimeSessionIds.add(installResponse.session.id);
+      const installResult = await RuntimeService.waitForSession(project.id, installResponse.session.id, signal);
+      this.activeRuntimeSessionIds.delete(installResponse.session.id);
+      if (installResult.status !== 'completed' || installResult.exitCode !== 0) {
+        throw new Error(`Dependency installation failed (exit code ${installResult.exitCode ?? 'unknown'}). ${installResult.events.map((event) => event.text).join(' ').slice(-1200)}`);
+      }
+      addThought('Dependencies Installed', `Dependency installation completed with exit code ${installResult.exitCode}.`, 'verification');
+
+      const devResponse = await RuntimeService.startDev(project.id, workingFiles, signal);
+      if (!devResponse.runtime || devResponse.runtime.state !== 'RUNNING' || devResponse.readiness !== 'PASS') throw new Error('Dev server failed HTTP readiness and never reached RUNNING.');
+      await RuntimeService.checkPreview(project.id, signal);
+      addThought('Runtime Ready', `Dev server is RUNNING on port ${devResponse.runtime.port}; HTTP readiness and real preview endpoint passed.`, 'verification');
+
+      const optionalScripts: Array<'lint' | 'typecheck' | 'test'> = ['lint', 'typecheck', 'test'];
+      for (const script of optionalScripts) {
+        try {
+          const response = await RuntimeService.runScript(project.id, workingFiles, script, signal);
+          if (!response.session) throw new Error(`${script} did not return a session.`);
+          this.activeRuntimeSessionIds.add(response.session.id);
+          const result = await RuntimeService.waitForSession(project.id, response.session.id, signal);
+          this.activeRuntimeSessionIds.delete(response.session.id);
+          if (result.status !== 'completed' || result.exitCode !== 0) throw new Error(`${script} failed (exit code ${result.exitCode ?? 'unknown'}). ${result.events.map((event) => event.text).join(' ').slice(-1200)}`);
+          addThought('Validation', `${script} passed with exit code 0.`, 'verification');
+        } catch (error: any) {
+          if (signal.aborted) throw new Error('Aborted by user');
+          if (error.message === 'NOT CONFIGURED' || error.message.includes('NOT CONFIGURED')) addThought('Validation', `${script}: NOT CONFIGURED`, 'observation');
+          else throw error;
+        }
+      }
+
+      let buildPassed = false;
+      for (let attempt = 0; attempt <= 3; attempt++) {
+        const buildResponse = await RuntimeService.runScript(project.id, workingFiles, 'build', signal).catch((error: Error) => {
+          if (error.message.includes('NOT CONFIGURED')) throw new Error('Production build is NOT CONFIGURED.');
+          throw error;
+        });
+        if (!buildResponse.session) throw new Error('Production build did not return a session.');
+        this.activeRuntimeSessionIds.add(buildResponse.session.id);
+        const buildResult = await RuntimeService.waitForSession(project.id, buildResponse.session.id, signal);
+        this.activeRuntimeSessionIds.delete(buildResponse.session.id);
+        if (buildResult.status === 'completed' && buildResult.exitCode === 0) { buildPassed = true; addThought('Production Build', 'Production build passed with exit code 0.', 'verification'); break; }
+        if (attempt === 3) throw new Error(`BLOCKED: production build failed after 3 repair attempts. ${buildResult.events.map((event) => event.text).join(' ').slice(-1600)}`);
+
+        const diagnostic = buildResult.events.map((event) => event.text).join('\n');
+        const affectedFiles = workingFiles.filter((file) => diagnostic.includes(file.path));
+        const repairTargets = affectedFiles.length > 0 ? affectedFiles : workingFiles.filter((file) => file.isModified).slice(-3);
+        if (repairTargets.length === 0) throw new Error(`BLOCKED: production build failed and no affected files were identified. ${diagnostic.slice(-1200)}`);
+        addThought('Self-Correction', `Production build failed; repairing ${repairTargets.length} affected file(s), attempt ${attempt + 1}/3.`, 'action');
+        for (const file of repairTargets) {
+          const repairRes = await fetch('/api/agent/repair-step', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filePath: file.path, currentContent: file.content, errors: [diagnostic.slice(-3000)], taskTitle: 'Repair production build', taskDescription: 'Fix the actual generated project build error.', goal }), signal });
+          if (!repairRes.ok) throw new Error(`BLOCKED: repair request failed for ${file.path}.`);
+          const repairData = await repairRes.json();
+          if (!repairData.repaired || typeof repairData.content !== 'string') throw new Error(`BLOCKED: no repair was produced for ${file.path}.`);
+          const repairedFile = { ...file, content: repairData.content, lastModified: Date.now(), isModified: true };
+          workingFiles = workingFiles.map((candidate) => candidate.path === file.path ? repairedFile : candidate);
+          callbacks.onFileUpdate(repairedFile);
+        }
+      }
+      if (!buildPassed) throw new Error('BLOCKED: production build did not pass.');
+
       // Phase 3: Real In-Memory Testing and Validation Matrix
       if (signal.aborted) throw new Error('Aborted by user');
       runState.status = 'running_tests';
@@ -557,7 +634,7 @@ export class AutonomousAgentEngine {
       runState.completedAt = Date.now();
       callbacks.onStateChange({ ...runState });
       addThought('Complete', 'All multi-file tasks executed, types verified via esbuild, and sandbox test suites executed.', 'verification');
-      callbacks.onCompleted(`Goal successfully fulfilled: "${goal}". Multi-file changes verified in sandbox.`);
+      callbacks.onCompleted(`READY: Goal fulfilled: "${goal}". Real workspace, dependencies, preview, validation, and production build verified.`);
     } catch (err: unknown) {
       const errorMsg = err instanceof Error ? err.message : 'Unknown execution error';
       if (errorMsg === 'Aborted by user') {
@@ -587,6 +664,8 @@ export class AutonomousAgentEngine {
     if (this.abortController) {
       this.abortController.abort();
     }
+    for (const sessionId of this.activeRuntimeSessionIds) void RuntimeService.cancelSession(sessionId);
+    if (this.activeProjectId) void RuntimeService.stopDev(this.activeProjectId);
     this.isRunning = false;
   }
 

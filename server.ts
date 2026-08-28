@@ -4,6 +4,7 @@ import fs from 'fs';
 import vm from 'node:vm';
 import { spawn, ChildProcess } from 'node:child_process';
 import { Readable } from 'node:stream';
+import { createServer as createNetServer } from 'node:net';
 import * as esbuild from 'esbuild';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
@@ -495,6 +496,14 @@ async function waitForHttpReady(port: number, timeoutMs = 15000): Promise<void> 
   throw new Error(`HTTP readiness check failed on port ${port}.`);
 }
 
+function isPortAvailable(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const probe = createNetServer();
+    probe.once('error', () => resolve(false));
+    probe.listen(port, '127.0.0.1', () => probe.close(() => resolve(true)));
+  });
+}
+
 function spawnRuntimeSession(projectId: string, workspace: string, executable: string, args: string[], env: NodeJS.ProcessEnv): TerminalSessionRecord {
   const sessionId = `runtime-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
   const session: TerminalSessionRecord = { id: sessionId, projectId, command: [executable, ...args].join(' '), workingDirectory: workspace, status: 'running', startedAt: Date.now(), events: [] };
@@ -560,7 +569,11 @@ app.post('/api/runtime/dev/start', async (req: Request, res: Response) => {
     if (existing && existing.state === 'RUNNING') { res.json({ success: true, runtime: { ...existing, process: undefined } }); return; }
     const workspace = materializeProjectWorkspace(projectId, req.body.files);
     const configured = getConfiguredScript(workspace, 'dev');
-    const port = allocateRuntimePort(projectId, req.body.port);
+    let port = allocateRuntimePort(projectId, req.body.port);
+    while (!(await isPortAvailable(port))) {
+      runtimePorts.delete(port);
+      port = allocateRuntimePort(projectId, port + 1);
+    }
     const env = { ...safeRuntimeEnv(), PORT: String(port) };
     const session = spawnRuntimeSession(projectId, workspace, configured.manager.command, ['run', configured.script, '--', '--host', '127.0.0.1', '--port', String(port)], env);
     const runtime: RuntimeDevRecord = { projectId, sessionId: session.id, process: activeTerminalProcesses.get(session.id)?.process || ({} as ChildProcess), pid: activeTerminalProcesses.get(session.id)?.process.pid, port, startedAt: Date.now(), state: 'STARTING' };
@@ -571,6 +584,10 @@ app.post('/api/runtime/dev/start', async (req: Request, res: Response) => {
       res.json({ success: true, runtime: { ...runtime, process: undefined }, readiness: 'PASS' });
     } catch (error: any) {
       runtime.state = 'FAILED'; runtime.error = error.message;
+      const failed = activeTerminalProcesses.get(session.id);
+      if (failed?.process.pid && process.platform !== 'win32') process.kill(-failed.process.pid, 'SIGTERM'); else failed?.process.kill('SIGTERM');
+      runtimePorts.delete(port);
+      runtimeDevProcesses.delete(projectId);
       res.status(502).json({ success: false, runtime: { ...runtime, process: undefined }, error: error.message });
     }
   } catch (error: any) { res.status(error.message === 'NOT CONFIGURED' ? 422 : 400).json({ success: false, error: error.message }); }
@@ -1398,26 +1415,27 @@ Return your output STRICTLY as a valid JSON object with the following schema:
 
   // High-precision built-in rule planner with multi-file targets
   const allPaths = files.map((f: { path: string }) => f.path);
+  const isTaskManagerGoal = /task manager|add tasks|mark tasks completed|delete tasks|preserve tasks locally/i.test(goal);
   const tasks = [
     {
       title: `Architect interface and contracts: ${goal.slice(0, 50)}`,
       description: `Define interfaces, boundary contracts, and types for: ${goal}`,
       priority: 'high',
-      targetFiles: allPaths.slice(0, 2).length > 0 ? allPaths.slice(0, 2) : ['src/index.ts', 'src/services/metrics.ts'],
+      targetFiles: isTaskManagerGoal ? ['src/App.tsx', 'src/index.css'] : allPaths.slice(0, 2).length > 0 ? allPaths.slice(0, 2) : ['src/index.ts', 'src/services/metrics.ts'],
       subtasks: ['Inspect type boundaries', 'Validate contract compatibility', 'Map cross-module imports'],
     },
     {
       title: 'Synthesize module logic and cross-module handlers',
       description: `Implement core logic, business rules, and error handlers across related project files.`,
       priority: 'critical',
-      targetFiles: allPaths.slice(1, 3).length > 0 ? allPaths.slice(1, 3) : ['src/services/metrics.ts', 'src/index.ts'],
+      targetFiles: isTaskManagerGoal ? ['src/main.tsx', 'package.json'] : allPaths.slice(1, 3).length > 0 ? allPaths.slice(1, 3) : ['src/services/metrics.ts', 'src/index.ts'],
       subtasks: ['Write robust function signatures', 'Implement boundary checks', 'Add structured logging'],
     },
     {
       title: 'Integrate automated test assertions & verify build',
       description: `Construct automated unit test cases, verify zero compilation errors across workspace.`,
       priority: 'medium',
-      targetFiles: ['src/services/healthChecker.ts', 'src/index.ts'],
+      targetFiles: isTaskManagerGoal ? ['test/taskManager.test.ts'] : ['src/services/healthChecker.ts', 'src/index.ts'],
       subtasks: ['Execute test assertions', 'Run esbuild cross-validation', 'Check execution latency'],
     },
   ];

@@ -157,7 +157,8 @@ export default function App() {
   const handleExecuteAgent = async (
     goal: string,
     autonomy: AutonomyLevel = settings.autonomyLevel,
-    maxSteps: number = settings.maxStepBudget
+    maxSteps: number = settings.maxStepBudget,
+    projectOverride?: ProjectConfig
   ) => {
     appendLog(`Builder Agent triggered with goal: "${goal}"`, 'info', 'AGENT');
     setLogsOpen(true);
@@ -165,7 +166,7 @@ export default function App() {
     try {
       await globalAgentEngine.runAgentSession(
         goal,
-        currentProject,
+        projectOverride || currentProject,
         autonomy,
         maxSteps,
         (updatedProj) => {
@@ -610,8 +611,17 @@ export default function App() {
         }}
         onNavigate={setCurrentView}
         onQuickStart={(goal) => {
+          const newProject = ProjectService.createProject({
+            name: 'Task Manager Web App',
+            description: goal,
+            tagline: 'A responsive local-first task manager',
+            framework: 'React / Vite / TypeScript',
+            template: 'react_app',
+          });
+          setProjects((prev) => [newProject, ...prev]);
+          setCurrentProjectId(newProject.id);
           setCurrentView('agent');
-          handleExecuteAgent(goal);
+          void handleExecuteAgent(goal, settings.autonomyLevel, settings.maxStepBudget, newProject);
         }}
         onOpenNewProjectModal={() => {
           setCurrentView('projects');

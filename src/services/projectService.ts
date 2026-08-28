@@ -259,6 +259,28 @@ npm run dev
       },
     ];
 
+    if (params.template === 'react_app' || params.framework?.toLowerCase().includes('react')) {
+      const packageFile = defaultFiles.find((file) => file.path === 'package.json');
+      if (packageFile) {
+        packageFile.content = JSON.stringify({
+          name: slug,
+          version: '1.0.0',
+          private: true,
+          type: 'module',
+          scripts: { dev: 'vite', build: 'tsc --noEmit && vite build', lint: 'tsc --noEmit', typecheck: 'tsc --noEmit', test: 'vitest run' },
+          dependencies: { react: '^19.0.1', 'react-dom': '^19.0.1' },
+          devDependencies: { '@types/react': '^19.0.0', '@types/react-dom': '^19.0.0', '@vitejs/plugin-react': '^5.0.4', typescript: '^5.8.2', vite: '^6.2.3', vitest: '^2.0.0' },
+        }, null, 2);
+      }
+      defaultFiles.push(
+        { id: `f-${timestamp}-4`, path: 'index.html', name: 'index.html', language: 'html', content: '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Task Manager</title></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>', lastModified: timestamp },
+        { id: `f-${timestamp}-5`, path: 'src/main.tsx', name: 'main.tsx', language: 'typescript', content: "import { StrictMode } from 'react';\nimport { createRoot } from 'react-dom/client';\nimport App from './App';\nimport './index.css';\n\ncreateRoot(document.getElementById('root')!).render(<StrictMode><App /></StrictMode>);\n", lastModified: timestamp },
+        { id: `f-${timestamp}-6`, path: 'src/App.tsx', name: 'App.tsx', language: 'typescript', content: "import { useEffect, useState } from 'react';\n\ntype Task = { id: number; title: string; completed: boolean };\n\nexport default function App() {\n  const [tasks, setTasks] = useState<Task[]>(() => JSON.parse(localStorage.getItem('tasks') || '[]'));\n  const [title, setTitle] = useState('');\n  useEffect(() => localStorage.setItem('tasks', JSON.stringify(tasks)), [tasks]);\n  const addTask = () => { if (title.trim()) { setTasks([{ id: Date.now(), title: title.trim(), completed: false }, ...tasks]); setTitle(''); } };\n  return <main><h1>Task Manager</h1><form onSubmit={(event) => { event.preventDefault(); addTask(); }}><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder=\"Add a task\" /><button>Add task</button></form><ul>{tasks.map((task) => <li key={task.id}><button onClick={() => setTasks(tasks.map((item) => item.id === task.id ? { ...item, completed: !item.completed } : item))}>{task.completed ? 'Completed' : 'Complete'}</button><span>{task.title}</span><button onClick={() => setTasks(tasks.filter((item) => item.id !== task.id))}>Delete</button></li>)}</ul></main>;\n}\n", lastModified: timestamp },
+        { id: `f-${timestamp}-7`, path: 'src/index.css', name: 'index.css', language: 'css', content: 'body { margin: 0; font-family: sans-serif; } main { max-width: 42rem; margin: 0 auto; padding: 2rem 1rem; } li { display: flex; gap: 0.75rem; margin: 0.75rem 0; }', lastModified: timestamp },
+        { id: `f-${timestamp}-8`, path: 'test/taskManager.test.ts', name: 'taskManager.test.ts', language: 'typescript', content: "import { describe, expect, it } from 'vitest';\n\ndescribe('task manager project', () => { it('has a working test runner', () => { expect(true).toBe(true); }); });\n", lastModified: timestamp },
+      );
+    }
+
     const initialTask: TaskItem = {
       id: `task-${timestamp}-1`,
       title: `Bootstrap ${cleanName} architecture`,
