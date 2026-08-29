@@ -357,13 +357,15 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({
         className="hidden"
       />
       <input
-        ref={directoryInputRef}
-        type="file"
-        multiple
-        webkitdirectory="true"
-        directory="true"
-        onChange={handleDirectoryImport}
-        className="hidden"
+        {...({
+          ref: directoryInputRef,
+          type: 'file',
+          multiple: true,
+          webkitdirectory: 'true',
+          directory: 'true',
+          onChange: handleDirectoryImport,
+          className: 'hidden',
+        } as any)}
       />
 
       {/* Header */}

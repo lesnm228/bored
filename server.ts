@@ -2218,8 +2218,16 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
+    const assetDir = path.join(distPath, 'assets');
+
+    app.use(express.static(distPath, { index: false }));
+    app.use('/assets', express.static(assetDir, { index: false }));
+
+    app.get(/^\/(?!api\/)(?!assets\/).*$/, (req, res, next) => {
+      if (/\.[A-Za-z0-9]+$/.test(req.path)) {
+        next();
+        return;
+      }
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }

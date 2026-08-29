@@ -516,15 +516,17 @@ export default function App() {
       version: `v1.4.${Math.floor(Math.random() * 10) + 1}`,
       environment: env,
       status: 'deploying' as const,
+      deployedAt: Date.now(),
       timestamp: Date.now(),
       commitHash: Math.random().toString(36).substr(2, 7),
       author: 'Kelvin',
+      branch: currentProject.branch || 'main',
       buildDurationSec: 42,
       logs: ['Pre-flight checks passed', 'Building container', 'Traffic routed'],
     };
 
     setTimeout(() => {
-      const finishedDep = { ...newDep, status: 'success' as const };
+      const finishedDep = { ...newDep, status: 'active' as const, deployedAt: Date.now() };
       handleUpdateProject({
         ...currentProject,
         deployments: [finishedDep, ...currentProject.deployments],
@@ -765,7 +767,7 @@ export default function App() {
               onRollbackTask={handleRollbackTask}
               onExecuteTaskWithAgent={(task) => {
                 setCurrentView('agent');
-                const taskProject = {
+                const taskProject: ProjectConfig = {
                   ...currentProject,
                   tasks: currentProject.tasks.map((currentTask) =>
                     currentTask.id === task.id
