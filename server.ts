@@ -821,6 +821,13 @@ app.post('/api/runtime/dev/stop/:projectId', (req: Request, res: Response) => {
   } catch (error: any) { res.status(400).json({ success: false, error: error.message }); }
 });
 
+function rewriteProjectScopedPreviewUrls(raw: string, projectId: string): string {
+  const proxyPrefix = `/api/runtime/preview/${encodeURIComponent(projectId)}`;
+  return raw
+    .replace(/(["'`])\/(?!\/)(?!api\/runtime\/preview\/)/g, `$1${proxyPrefix}/`)
+    .replace(/url\(\s*(["']?)(\/)(?!\/)(?!api\/runtime\/preview\/)/g, `url($1${proxyPrefix}/`);
+}
+
 app.get('/api/runtime/preview/:projectId/*', async (req: Request, res: Response) => {
   try {
     const projectId = assertProjectId(req.params.projectId);
@@ -842,11 +849,17 @@ app.get('/api/runtime/preview/:projectId/*', async (req: Request, res: Response)
 
     if (!upstream.body) { res.end(); return; }
 
-    if (contentType.includes('text/html')) {
-      const html = await upstream.text();
-      const proxyPrefix = `/api/runtime/preview/${encodeURIComponent(projectId)}`;
-      const rewritten = html.replace(/(src|href)=(['"])(\/)(?!\/)/g, `$1=$2${proxyPrefix}/`);
-      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    const isTextual = contentType.includes('text/html') || contentType.includes('javascript') || contentType.includes('text/css');
+    if (isTextual) {
+      const text = await upstream.text();
+      const rewritten = rewriteProjectScopedPreviewUrls(text, projectId);
+      if (contentType.includes('text/html')) {
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      } else if (contentType.includes('text/css')) {
+        res.setHeader('Content-Type', 'text/css; charset=utf-8');
+      } else {
+        res.setHeader('Content-Type', 'text/javascript; charset=utf-8');
+      }
       res.end(rewritten);
       return;
     }
