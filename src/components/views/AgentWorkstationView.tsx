@@ -61,6 +61,8 @@ export const AgentWorkstationView: React.FC<AgentWorkstationViewProps> = ({
   const executionEvidence = agentState.thoughtLog
     .filter((entry) => entry.type !== 'thought')
     .slice(-12);
+  const runtimeEvidence = (agentState.runtimeEvidence || []).slice(-8);
+  const filesTouched = (agentState.filesTouched || []).slice(0, 8);
 
   const sendChat = async () => {
     const userText = chatInput.trim();
@@ -80,6 +82,21 @@ export const AgentWorkstationView: React.FC<AgentWorkstationViewProps> = ({
     setIsSendingChat(true);
 
     try {
+      const isBuildRequest = /\b(build|implement|fix|add|create|update|refactor|debug|repair|test|deploy|integrate|optimize)\b/i.test(userText);
+
+      if (isBuildRequest) {
+        await onExecuteAgent(userText, 'fully_autonomous', 12);
+        setChatMessages((prev) => [
+          ...prev,
+          {
+            sender: 'agent',
+            text: `Executing the real Builder Board runtime for: "${userText}". Runtime status, task progress, and verification evidence will be shown in the execution panel as they are reported.`,
+            timestamp: Date.now(),
+          },
+        ]);
+        return;
+      }
+
       const res = await fetch('/api/agent/chat', {
         method: 'POST',
         headers: {
@@ -304,6 +321,28 @@ export const AgentWorkstationView: React.FC<AgentWorkstationViewProps> = ({
                     </div>
                   )}
 
+                  {agentState.activeTask && (
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wide text-slate-500">
+                        Active task
+                      </div>
+                      <div className="mt-1 text-sm text-slate-300">
+                        {agentState.activeTask}
+                      </div>
+                    </div>
+                  )}
+
+                  {agentState.planSummary && (
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wide text-slate-500">
+                        Plan summary
+                      </div>
+                      <div className="mt-1 text-sm text-slate-300">
+                        {agentState.planSummary}
+                      </div>
+                    </div>
+                  )}
+
                   {agentState.totalSteps > 0 && (
                     <div className="flex items-center gap-2 text-xs text-slate-400">
                       {agentState.status === 'completed' ? (
@@ -383,6 +422,37 @@ export const AgentWorkstationView: React.FC<AgentWorkstationViewProps> = ({
                     </div>
                   )}
 
+                  {filesTouched.length > 0 && (
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wide text-slate-500">
+                        Files touched
+                      </div>
+                      <div className="mt-1 flex flex-wrap gap-2">
+                        {filesTouched.map((file) => (
+                          <button
+                            key={file}
+                            type="button"
+                            onClick={onOpenFiles}
+                            className="rounded border border-slate-700 bg-slate-900/80 px-2 py-1 font-mono text-[10px] text-slate-300 hover:border-blue-500 hover:text-blue-200"
+                          >
+                            {file}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {agentState.runtimePort && (
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wide text-slate-500">
+                        Runtime status
+                      </div>
+                      <div className="mt-1 text-xs text-slate-300">
+                        {agentState.runtimeStatus || 'running'} on port {agentState.runtimePort}
+                      </div>
+                    </div>
+                  )}
+
                   {agentState.error && (
                     <div className="rounded-md border border-red-900/70 bg-red-950/30 px-3 py-3">
                       <div className="flex items-start gap-2">
@@ -404,12 +474,45 @@ export const AgentWorkstationView: React.FC<AgentWorkstationViewProps> = ({
                       Activity
                     </div>
 
-                    {executionEvidence.length === 0 ? (
+                    {executionEvidence.length === 0 && runtimeEvidence.length === 0 ? (
                       <div className="text-xs text-slate-500">
-                        No execution evidence has been reported yet.
+                        No runtime evidence has been generated yet for this instruction.
                       </div>
                     ) : (
                       <div className="space-y-2">
+                        {runtimeEvidence.map((entry, index) => (
+                          <div
+                            key={`${entry.id}-${index}`}
+                            className="border-l-2 border-slate-700 pl-3 py-1"
+                          >
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span
+                                className={`text-[10px] font-semibold uppercase tracking-wide ${
+                                  entry.status === 'passed'
+                                    ? 'text-emerald-400'
+                                    : entry.status === 'failed'
+                                      ? 'text-red-400'
+                                      : entry.status === 'unavailable'
+                                        ? 'text-slate-400'
+                                        : 'text-amber-300'
+                                }`}
+                              >
+                                {entry.category}
+                              </span>
+                              <span className="text-[10px] text-slate-600">
+                                {entry.label}
+                              </span>
+                              <span className="text-[10px] text-slate-600">
+                                {formatTime(entry.timestamp)}
+                              </span>
+                            </div>
+
+                            <div className="mt-1 whitespace-pre-wrap break-words text-xs leading-5 text-slate-300">
+                              {entry.detail}
+                            </div>
+                          </div>
+                        ))}
+
                         {executionEvidence.map((entry, index) => (
                           <div
                             key={`${entry.timestamp}-${index}`}

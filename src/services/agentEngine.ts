@@ -23,6 +23,11 @@ export class AutonomousAgentEngine {
     currentStepIndex: 0,
     totalSteps: 0,
     thoughtLog: [],
+    runtimeStatus: 'pending',
+    filesTouched: [],
+    validationEvidence: [],
+    commandEvidence: [],
+    runtimeEvidence: [],
   };
   private listeners: Array<(state: AgentRunState) => void> = [];
 
@@ -121,7 +126,25 @@ export class AutonomousAgentEngine {
       currentStepIndex: 0,
       totalSteps: 4,
       thoughtLog: [],
+      filesTouched: [],
+      validationEvidence: [],
+      commandEvidence: [],
+      runtimeEvidence: [],
+      runtimeStatus: 'pending',
       startedAt: Date.now(),
+    };
+
+    const addRuntimeEvidence = (category: AgentRunState['runtimeEvidence'][number]['category'], label: string, detail: string, status?: AgentRunState['runtimeEvidence'][number]['status']) => {
+      const item = {
+        id: `evidence-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        timestamp: Date.now(),
+        category,
+        label,
+        detail,
+        status,
+      };
+      runState.runtimeEvidence = [...(runState.runtimeEvidence || []), item];
+      callbacks.onStateChange({ ...runState });
     };
 
     const addThought = (phase: string, message: string, type: 'thought' | 'action' | 'observation' | 'verification' = 'thought') => {
@@ -216,6 +239,8 @@ export class AutonomousAgentEngine {
       }
 
       runState.totalSteps = planResult.tasks.length;
+      runState.planSummary = planResult.summary;
+      addRuntimeEvidence('planning', 'Execution plan', planResult.summary, 'pending');
       addThought('Plan Created', `Identified ${planResult.tasks.length} critical tasks: ${planResult.summary}`, 'observation');
 
       // Keep snapshot of workspace files for overall rollback if needed
@@ -245,6 +270,7 @@ export class AutonomousAgentEngine {
         }
 
         // Initialize Task Item with planned files and rollback capability
+        runState.activeTask = taskDef.title;
         const newTaskItem: TaskItem = {
           id: `agent-task-${Date.now()}-${i}`,
           title: taskDef.title,
@@ -326,6 +352,8 @@ export class AutonomousAgentEngine {
           });
 
           filesChangedInTask.push(updatedFile);
+          runState.filesTouched = Array.from(new Set([...(runState.filesTouched || []), targetPath]));
+          addRuntimeEvidence('file', `Updated ${targetPath}`, `Modified ${targetPath} during task: ${taskDef.title}`, 'running');
 
           // Update local working files array
           const exIdx = workingFiles.findIndex((f) => f.path === targetPath);
@@ -365,6 +393,7 @@ export class AutonomousAgentEngine {
 
           if (valRes.ok) {
             const valData = await valRes.json();
+            runState.validationEvidence = Array.isArray(valData.logs) ? [...valData.logs] : runState.validationEvidence || [];
             valData.logs?.forEach((l: string) => {
               callbacks.onLog({
                 id: `log-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
@@ -528,10 +557,15 @@ export class AutonomousAgentEngine {
       if (installResult.status !== 'completed' || installResult.exitCode !== 0) {
         throw new Error(`Dependency installation failed (exit code ${installResult.exitCode ?? 'unknown'}). ${installResult.events.map((event) => event.text).join(' ').slice(-1200)}`);
       }
+      runState.commandEvidence = [...(runState.commandEvidence || []), { command: 'npm install', status: 'passed', exitCode: installResult.exitCode, detail: 'Dependencies installed successfully.', timestamp: Date.now() }];
+      addRuntimeEvidence('runtime', 'Dependency installation', `Exit code ${installResult.exitCode}`, 'passed');
       addThought('Dependencies Installed', `Dependency installation completed with exit code ${installResult.exitCode}.`, 'verification');
 
       const devResponse = await RuntimeService.startDev(project.id, workingFiles, signal);
       if (!devResponse.runtime || devResponse.runtime.state !== 'RUNNING' || devResponse.readiness !== 'PASS') throw new Error('Dev server failed HTTP readiness and never reached RUNNING.');
+      runState.runtimePort = devResponse.runtime.port;
+      runState.runtimeStatus = 'running';
+      addRuntimeEvidence('runtime', 'Dev server', `Project runtime is listening on port ${devResponse.runtime.port}.`, 'passed');
       await RuntimeService.checkPreview(project.id, signal);
       addThought('Runtime Ready', `Dev server is RUNNING on port ${devResponse.runtime.port}; HTTP readiness and real preview endpoint passed.`, 'verification');
 
@@ -544,11 +578,16 @@ export class AutonomousAgentEngine {
           const result = await RuntimeService.waitForSession(project.id, response.session.id, signal);
           this.activeRuntimeSessionIds.delete(response.session.id);
           if (result.status !== 'completed' || result.exitCode !== 0) throw new Error(`${script} failed (exit code ${result.exitCode ?? 'unknown'}). ${result.events.map((event) => event.text).join(' ').slice(-1200)}`);
+          runState.commandEvidence = [...(runState.commandEvidence || []), { command: script, status: 'passed', exitCode: result.exitCode, detail: `${script} completed successfully.`, timestamp: Date.now() }];
+          addRuntimeEvidence('validation', `${script} validation`, `Exit code ${result.exitCode}.`, 'passed');
           addThought('Validation', `${script} passed with exit code 0.`, 'verification');
         } catch (error: any) {
           if (signal.aborted) throw new Error('Aborted by user');
-          if (error.message === 'NOT CONFIGURED' || error.message.includes('NOT CONFIGURED')) addThought('Validation', `${script}: NOT CONFIGURED`, 'observation');
-          else throw error;
+          if (error.message === 'NOT CONFIGURED' || error.message.includes('NOT CONFIGURED')) {
+            runState.commandEvidence = [...(runState.commandEvidence || []), { command: script, status: 'not_configured', detail: 'Script is not configured for this project.', timestamp: Date.now() }];
+            addRuntimeEvidence('validation', `${script} validation`, 'Not configured for this project.', 'unavailable');
+            addThought('Validation', `${script}: NOT CONFIGURED`, 'observation');
+          } else throw error;
         }
       }
 
@@ -562,10 +601,18 @@ export class AutonomousAgentEngine {
         this.activeRuntimeSessionIds.add(buildResponse.session.id);
         const buildResult = await RuntimeService.waitForSession(project.id, buildResponse.session.id, signal);
         this.activeRuntimeSessionIds.delete(buildResponse.session.id);
-        if (buildResult.status === 'completed' && buildResult.exitCode === 0) { buildPassed = true; addThought('Production Build', 'Production build passed with exit code 0.', 'verification'); break; }
+        if (buildResult.status === 'completed' && buildResult.exitCode === 0) {
+          buildPassed = true;
+          runState.commandEvidence = [...(runState.commandEvidence || []), { command: 'build', status: 'passed', exitCode: buildResult.exitCode, detail: 'Production build completed successfully.', timestamp: Date.now() }];
+          addRuntimeEvidence('build', 'Production build', `Exit code ${buildResult.exitCode}.`, 'passed');
+          addThought('Production Build', 'Production build passed with exit code 0.', 'verification');
+          break;
+        }
         if (attempt === 3) throw new Error(`BLOCKED: production build failed after 3 repair attempts. ${buildResult.events.map((event) => event.text).join(' ').slice(-1600)}`);
 
         const diagnostic = buildResult.events.map((event) => event.text).join('\n');
+        runState.commandEvidence = [...(runState.commandEvidence || []), { command: 'build', status: 'failed', exitCode: buildResult.exitCode, detail: diagnostic.slice(-1200), timestamp: Date.now() }];
+        addRuntimeEvidence('build', 'Production build', diagnostic.slice(-1200), 'failed');
         const affectedFiles = workingFiles.filter((file) => diagnostic.includes(file.path));
         const repairTargets = affectedFiles.length > 0 ? affectedFiles : workingFiles.filter((file) => file.isModified).slice(-3);
         if (repairTargets.length === 0) throw new Error(`BLOCKED: production build failed and no affected files were identified. ${diagnostic.slice(-1200)}`);
@@ -632,6 +679,8 @@ export class AutonomousAgentEngine {
 
       runState.status = 'completed';
       runState.completedAt = Date.now();
+      runState.runtimeStatus = 'running';
+      addRuntimeEvidence('runtime', 'Completion', `Goal fulfilled: "${goal}". Runtime verification passed.`, 'passed');
       callbacks.onStateChange({ ...runState });
       addThought('Complete', 'All multi-file tasks executed, types verified via esbuild, and sandbox test suites executed.', 'verification');
       callbacks.onCompleted(`READY: Goal fulfilled: "${goal}". Real workspace, dependencies, preview, validation, and production build verified.`);
@@ -650,6 +699,8 @@ export class AutonomousAgentEngine {
       } else {
         runState.status = 'error';
         runState.error = errorMsg;
+        runState.runtimeStatus = 'failed';
+        addRuntimeEvidence('error', 'Execution error', errorMsg, 'failed');
         addThought('Error', `Execution halted: ${errorMsg}`, 'action');
         callbacks.onError(errorMsg);
       }

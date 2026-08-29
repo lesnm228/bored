@@ -183,6 +183,15 @@ export interface ProjectConfig {
   gitBaselineFiles?: { path: string; content: string }[];
 }
 
+export interface AgentRuntimeEvidence {
+  id: string;
+  timestamp: number;
+  category: 'planning' | 'task' | 'file' | 'runtime' | 'validation' | 'build' | 'test' | 'error';
+  label: string;
+  detail: string;
+  status?: 'pending' | 'running' | 'passed' | 'failed' | 'unavailable';
+}
+
 export interface AgentRunState {
   status: AgentStatus;
   currentGoal: string;
@@ -195,6 +204,20 @@ export interface AgentRunState {
     type?: 'thought' | 'action' | 'observation' | 'verification';
   }[];
   activeFile?: string;
+  activeTask?: string;
+  planSummary?: string;
+  filesTouched?: string[];
+  runtimePort?: number;
+  runtimeStatus?: 'pending' | 'starting' | 'running' | 'failed' | 'stopped' | 'unavailable';
+  validationEvidence?: string[];
+  commandEvidence?: Array<{
+    command: string;
+    status: 'pending' | 'passed' | 'failed' | 'not_configured' | 'unavailable';
+    exitCode?: number | null;
+    detail?: string;
+    timestamp: number;
+  }>;
+  runtimeEvidence?: AgentRuntimeEvidence[];
   error?: string;
   startedAt?: number;
   completedAt?: number;
