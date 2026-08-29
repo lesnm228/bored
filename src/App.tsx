@@ -52,6 +52,26 @@ export default function App() {
   const activeCancelRef = useRef<(() => Promise<boolean>) | null>(null);
   const [runtime, setRuntime] = useState<{ state: string; port?: number; sessionId?: string } | null>(null);
 
+  const syncRuntimeStatus = useCallback(async () => {
+    if (!currentProjectId) {
+      setRuntime({ state: 'STOPPED' });
+      return;
+    }
+
+    try {
+      const res = await fetch(`/api/runtime/dev/status/${encodeURIComponent(currentProjectId)}`);
+      if (!res.ok) {
+        setRuntime({ state: 'STOPPED' });
+        return;
+      }
+
+      const data = await res.json();
+      setRuntime(data?.runtime && data.runtime.state ? data.runtime : { state: 'STOPPED' });
+    } catch {
+      setRuntime({ state: 'STOPPED' });
+    }
+  }, [currentProjectId]);
+
   // Save to persistent storage when state changes
   useEffect(() => {
     ProjectService.saveProjects(projects, currentProjectId);
@@ -85,9 +105,27 @@ export default function App() {
   useEffect(() => {
     const unsub = globalAgentEngine.subscribe((state) => {
       setAgentState(state);
+      if (state.runtimeStatus === 'running') {
+        void syncRuntimeStatus();
+      }
     });
     return unsub;
-  }, []);
+  }, [syncRuntimeStatus]);
+
+  useEffect(() => {
+    void syncRuntimeStatus();
+  }, [syncRuntimeStatus]);
+
+  useEffect(() => {
+    const shouldPoll = currentView === 'preview' || currentView === 'deployments';
+    if (!shouldPoll || !currentProjectId) return;
+
+    const intervalId = window.setInterval(() => {
+      void syncRuntimeStatus();
+    }, 3000);
+
+    return () => window.clearInterval(intervalId);
+  }, [currentProjectId, currentView, syncRuntimeStatus]);
 
   const currentProject =
     projects.find((p) => p.id === currentProjectId) || projects[0];
@@ -601,6 +639,7 @@ export default function App() {
       if (!res.ok) throw new Error(data.error || 'Dev server failed to start.');
       setRuntime(data.runtime);
       appendLog(`HTTP readiness passed on port ${data.runtime.port}. Real preview is available.`, 'success', 'RUNTIME');
+      await syncRuntimeStatus();
     } catch (error: any) {
       setRuntime({ state: 'FAILED' });
       appendLog(`Generated project failed to start: ${error.message}`, 'error', 'RUNTIME');
@@ -612,6 +651,7 @@ export default function App() {
     if (res.ok) {
       setRuntime({ state: 'STOPPED' });
       appendLog('Generated project dev server stopped.', 'info', 'RUNTIME');
+      await syncRuntimeStatus();
     }
   };
 

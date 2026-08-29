@@ -780,8 +780,9 @@ app.post('/api/runtime/dev/start', async (req: Request, res: Response) => {
       runtimePorts.delete(port);
       port = allocateRuntimePort(projectId, port + 1);
     }
+    const previewBase = `/api/runtime/preview/${encodeURIComponent(projectId)}/`;
     const env = { ...safeRuntimeEnv(), PORT: String(port) };
-    const session = spawnRuntimeSession(projectId, workspace, configured.manager.command, ['run', configured.script, '--', '--host', '127.0.0.1', '--port', String(port)], env);
+    const session = spawnRuntimeSession(projectId, workspace, configured.manager.command, ['run', configured.script, '--', '--host', '127.0.0.1', '--port', String(port), '--base', previewBase], env);
     const runtime: RuntimeDevRecord = { projectId, sessionId: session.id, process: activeTerminalProcesses.get(session.id)?.process || ({} as ChildProcess), pid: activeTerminalProcesses.get(session.id)?.process.pid, port, startedAt: Date.now(), state: 'STARTING' };
     runtimeDevProcesses.set(projectId, runtime);
     try {
@@ -821,30 +822,28 @@ app.post('/api/runtime/dev/stop/:projectId', (req: Request, res: Response) => {
   } catch (error: any) { res.status(400).json({ success: false, error: error.message }); }
 });
 
-function rewritePreviewUrls(content: string, previewPrefix: string): string {
-  return content
-    .replace(/<script\b[^>]*\bsrc=["']\/\@vite\/client["'][^>]*><\/script>/gi, '')
-    .replace(/(["'(=])\/(?!\/|api\/|api\/runtime\/preview\/)/g, `$1${previewPrefix}`);
-}
-
 app.get('/api/runtime/preview/:projectId/*', async (req: Request, res: Response) => {
   try {
     const projectId = assertProjectId(req.params.projectId);
     const runtime = runtimeDevProcesses.get(projectId);
     if (!runtime || runtime.state !== 'RUNNING') { res.status(503).json({ success: false, error: 'Project preview unavailable: dev server is not RUNNING.' }); return; }
+
     const suffix = req.params[0] || '';
-    const upstream = await fetch(`http://127.0.0.1:${runtime.port}/${suffix}${req.url.includes('?') ? `?${req.url.split('?')[1]}` : ''}`);
+    const query = req.url.includes('?') ? `?${req.url.split('?')[1]}` : '';
+    const upstream = await fetch(`http://127.0.0.1:${runtime.port}/${suffix}${query}`);
+
     res.status(upstream.status);
-    const contentType = upstream.headers.get('content-type') || '';
-    const shouldRewrite = /text\/html|javascript|text\/css/.test(contentType);
     upstream.headers.forEach((value, key) => {
-      if (key !== 'content-encoding' && !(shouldRewrite && (key === 'content-length' || key === 'etag'))) res.setHeader(key, value);
+      if (key !== 'content-encoding' && key !== 'content-length' && key !== 'etag') {
+        res.setHeader(key, value);
+      }
     });
+
     if (!upstream.body) { res.end(); return; }
-    if (!shouldRewrite) { Readable.fromWeb(upstream.body as any).pipe(res); return; }
+
     const body = Buffer.from(await upstream.arrayBuffer());
-    const previewPrefix = `/api/runtime/preview/${encodeURIComponent(projectId)}/`;
-    res.send(rewritePreviewUrls(body.toString('utf-8'), previewPrefix));
+    if (body.length === 0) { res.end(); return; }
+    res.send(body);
   } catch (error: any) { res.status(502).json({ success: false, error: `Preview unavailable: ${error.message}` }); }
 });
 
