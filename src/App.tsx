@@ -28,6 +28,8 @@ import { DeploymentsView } from './components/views/DeploymentsView';
 import { HistoryView } from './components/views/HistoryView';
 import { SettingsView } from './components/views/SettingsView';
 import { ProjectsView } from './components/views/ProjectsView';
+import { TerminalView } from './components/views/TerminalView';
+import { PreviewView } from './components/views/PreviewView';
 import { OutputLogsDrawer } from './components/OutputLogsDrawer';
 
 export default function App() {
@@ -527,7 +529,9 @@ export default function App() {
   // Terminal Command Execution
   const handleExecuteTerminalCommand = async (commandStr: string) => {
     if (!commandStr.trim() || isExecutingCommand) return;
-    setLogsOpen(true);
+    // Only auto-pop the floating logs drawer when the user isn't already
+    // looking at the dedicated Terminal page (avoids a duplicate terminal).
+    if (currentView !== 'terminal') setLogsOpen(true);
     setIsExecutingCommand(true);
     appendLog(`$ ${commandStr}`, 'agent', 'TERMINAL');
 
@@ -748,6 +752,27 @@ export default function App() {
               onUpdateProjectEnv={(newEnvs) =>
                 handleUpdateProject({ ...currentProject, envVariables: newEnvs })
               }
+              onNavigate={setCurrentView}
+            />
+          )}
+
+          {currentView === 'terminal' && (
+            <TerminalView
+              logs={logs}
+              activeSession={activeTerminalSession}
+              isExecuting={isExecutingCommand}
+              onExecuteCommand={handleExecuteTerminalCommand}
+              onCancelCommand={handleCancelTerminalCommand}
+              onClearLogs={() => setLogs([])}
+            />
+          )}
+
+          {currentView === 'preview' && (
+            <PreviewView
+              currentProject={currentProject}
+              runtime={runtime}
+              onStartRuntime={handleStartRuntime}
+              onStopRuntime={handleStopRuntime}
             />
           )}
 

@@ -13,14 +13,18 @@ import {
   Cpu,
   Server,
   Zap,
+  History,
+  Rocket,
+  ChevronRight,
 } from 'lucide-react';
-import { ProjectConfig, WorkspaceSettings, AutonomyLevel } from '../../types';
+import { ProjectConfig, WorkspaceSettings, AutonomyLevel, WorkspaceView } from '../../types';
 
 interface SettingsViewProps {
   currentProject: ProjectConfig;
   settings: WorkspaceSettings;
   onUpdateSettings: (newSettings: WorkspaceSettings) => void;
   onUpdateProjectEnv: (newEnvs: ProjectConfig['envVariables']) => void;
+  onNavigate: (view: WorkspaceView) => void;
 }
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
@@ -28,6 +32,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   settings,
   onUpdateSettings,
   onUpdateProjectEnv,
+  onNavigate,
 }) => {
   const [localSettings, setLocalSettings] = useState<WorkspaceSettings>(settings);
   const [envVars, setEnvVars] = useState(currentProject.envVariables || []);
@@ -95,6 +100,42 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       </div>
 
       <div className="mt-6 space-y-6 max-w-4xl">
+        {/* Workspace Tools: secondary access for History & Deployments */}
+        <div className="rounded-2xl bg-[#0a101f]/80 backdrop-blur-md border border-blue-900/50 p-5 space-y-3">
+          <div className="flex items-center gap-2 pb-2 border-b border-blue-900/40">
+            <Server className="w-4 h-4 text-blue-400" />
+            <h2 className="text-xs font-bold text-slate-100 uppercase tracking-wider">Workspace Tools</h2>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <button
+              onClick={() => onNavigate('history')}
+              className="flex items-center justify-between p-3 rounded-xl bg-[#030816] border border-blue-900/40 hover:border-amber-500/40 transition-colors text-left"
+            >
+              <div className="flex items-center gap-2.5">
+                <History className="w-4 h-4 text-blue-400" />
+                <div>
+                  <div className="text-xs font-semibold text-slate-200">History</div>
+                  <div className="text-[11px] text-slate-500">Commits, builds, and milestones</div>
+                </div>
+              </div>
+              <ChevronRight className="w-4 h-4 text-slate-500" />
+            </button>
+            <button
+              onClick={() => onNavigate('deployments')}
+              className="flex items-center justify-between p-3 rounded-xl bg-[#030816] border border-blue-900/40 hover:border-amber-500/40 transition-colors text-left"
+            >
+              <div className="flex items-center gap-2.5">
+                <Rocket className="w-4 h-4 text-amber-400" />
+                <div>
+                  <div className="text-xs font-semibold text-slate-200">Deployments</div>
+                  <div className="text-[11px] text-slate-500">Environments, releases, rollbacks</div>
+                </div>
+              </div>
+              <ChevronRight className="w-4 h-4 text-slate-500" />
+            </button>
+          </div>
+        </div>
+
         {/* Section 1: Agent Safety & Autonomy Controls */}
         <div className="rounded-2xl bg-[#0a101f]/80 backdrop-blur-md border border-blue-900/50 p-5 space-y-4">
           <div className="flex items-center gap-2 pb-2 border-b border-blue-900/40">

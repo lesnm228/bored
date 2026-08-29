@@ -3,8 +3,10 @@ export type WorkspaceView =
   | 'agent'
   | 'projects'
   | 'files'
+  | 'terminal'
   | 'tasks'
   | 'tests'
+  | 'preview'
   | 'deployments'
   | 'history'
   | 'settings';
