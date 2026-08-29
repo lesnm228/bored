@@ -56,6 +56,12 @@ export const AgentWorkstationView: React.FC<AgentWorkstationViewProps> = ({
       minute: '2-digit',
     });
 
+  // Stage 3: expose only execution evidence that is safe/useful to the user.
+  // Raw internal "thought" entries are intentionally not rendered.
+  const executionEvidence = agentState.thoughtLog
+    .filter((entry) => entry.type !== 'thought')
+    .slice(-12);
+
   const sendChat = async () => {
     const userText = chatInput.trim();
 
@@ -320,6 +326,133 @@ export const AgentWorkstationView: React.FC<AgentWorkstationViewProps> = ({
                     existing Builder Board runtime. No synthetic completion
                     percentage is generated here.
                   </p>
+                </div>
+              </section>
+            )}
+
+            {(executionEvidence.length > 0 ||
+              agentState.activeFile ||
+              agentState.error ||
+              agentState.startedAt ||
+              agentState.completedAt) && (
+              <section className="mt-6 border border-slate-800 rounded-lg bg-[#07111f]">
+                <div className="flex items-center justify-between gap-4 px-4 py-3 border-b border-slate-800">
+                  <div>
+                    <div className="text-xs font-semibold text-slate-200">
+                      Execution evidence
+                    </div>
+                    <div className="mt-0.5 text-[10px] text-slate-500">
+                      Reported by the existing Builder Board agent runtime
+                    </div>
+                  </div>
+
+                  <div className="text-[10px] uppercase tracking-wide text-amber-300">
+                    {String(agentState.status).replace(/_/g, ' ')}
+                  </div>
+                </div>
+
+                <div className="px-4 py-4 space-y-4">
+                  {(agentState.startedAt || agentState.completedAt) && (
+                    <div className="flex flex-wrap gap-x-5 gap-y-2 text-xs text-slate-400">
+                      {agentState.startedAt && (
+                        <span>
+                          Started {formatTime(agentState.startedAt)}
+                        </span>
+                      )}
+
+                      {agentState.completedAt && (
+                        <span>
+                          Completed {formatTime(agentState.completedAt)}
+                        </span>
+                      )}
+                    </div>
+                  )}
+
+                  {agentState.activeFile && (
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wide text-slate-500">
+                        Active file
+                      </div>
+                      <button
+                        type="button"
+                        onClick={onOpenFiles}
+                        className="mt-1 text-left font-mono text-xs text-blue-300 hover:text-blue-200"
+                      >
+                        {agentState.activeFile}
+                      </button>
+                    </div>
+                  )}
+
+                  {agentState.error && (
+                    <div className="rounded-md border border-red-900/70 bg-red-950/30 px-3 py-3">
+                      <div className="flex items-start gap-2">
+                        <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-400" />
+                        <div>
+                          <div className="text-xs font-semibold text-red-300">
+                            Execution error
+                          </div>
+                          <div className="mt-1 whitespace-pre-wrap break-words text-xs leading-5 text-red-200/80">
+                            {agentState.error}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  <div>
+                    <div className="mb-2 text-[10px] uppercase tracking-wide text-slate-500">
+                      Activity
+                    </div>
+
+                    {executionEvidence.length === 0 ? (
+                      <div className="text-xs text-slate-500">
+                        No execution evidence has been reported yet.
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        {executionEvidence.map((entry, index) => (
+                          <div
+                            key={`${entry.timestamp}-${index}`}
+                            className="border-l-2 border-slate-700 pl-3 py-1"
+                          >
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span
+                                className={`text-[10px] font-semibold uppercase tracking-wide ${
+                                  entry.type === 'verification'
+                                    ? 'text-emerald-400'
+                                    : entry.type === 'action'
+                                      ? 'text-amber-300'
+                                      : 'text-blue-300'
+                                }`}
+                              >
+                                {entry.type}
+                              </span>
+
+                              {entry.phase && (
+                                <span className="text-[10px] text-slate-600">
+                                  {entry.phase}
+                                </span>
+                              )}
+
+                              <span className="text-[10px] text-slate-600">
+                                {formatTime(entry.timestamp)}
+                              </span>
+                            </div>
+
+                            <div className="mt-1 whitespace-pre-wrap break-words text-xs leading-5 text-slate-300">
+                              {entry.message}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="text-[10px] leading-4 text-slate-600">
+                    Builder Board does not mark work successful here unless the
+                    underlying runtime reports corresponding execution or
+                    verification evidence.
+                  </div>
                 </div>
               </section>
             )}
