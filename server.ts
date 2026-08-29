@@ -13,7 +13,8 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
+const isProduction = process.env.NODE_ENV === 'production' || fs.existsSync(path.join(process.cwd(), 'dist', 'index.html'));
 
 app.use(express.json({ limit: '10mb' }));
 
@@ -2197,7 +2198,7 @@ app.post('/api/workspace/run-tests', async (req: Request, res: Response) => {
 
 // Vite middleware for development & static files in production
 async function startServer() {
-  if (process.env.NODE_ENV !== 'production') {
+  if (!isProduction) {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
