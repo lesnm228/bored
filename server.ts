@@ -2,7 +2,7 @@ import express, { Request, Response } from 'express';
 import path from 'path';
 import fs from 'fs';
 import vm from 'node:vm';
-import { spawn, ChildProcess } from 'node:child_process';
+import { spawn, ChildProcess, spawnSync } from 'node:child_process';
 import { Readable } from 'node:stream';
 import { createServer as createNetServer } from 'node:net';
 import * as esbuild from 'esbuild';
@@ -431,6 +431,166 @@ function prepareWorkspaceDirectory(projectId: string, files?: Array<{ path: stri
 function assertProjectId(projectId: unknown): string {
   if (typeof projectId !== 'string' || !/^[a-zA-Z0-9_-]{1,100}$/.test(projectId)) throw new Error('Invalid project ID.');
   return projectId;
+}
+
+function inferLanguageFromPath(filePath: string): 'typescript' | 'javascript' | 'json' | 'css' | 'html' | 'markdown' | 'env' | 'yaml' | 'sql' {
+  const normalized = filePath.toLowerCase();
+  if (normalized.endsWith('.ts') || normalized.endsWith('.tsx')) return 'typescript';
+  if (normalized.endsWith('.js') || normalized.endsWith('.jsx')) return 'javascript';
+  if (normalized.endsWith('.json')) return 'json';
+  if (normalized.endsWith('.css')) return 'css';
+  if (normalized.endsWith('.html') || normalized.endsWith('.htm')) return 'html';
+  if (normalized.endsWith('.md') || normalized.endsWith('.mdx')) return 'markdown';
+  if (normalized.endsWith('.env') || normalized.includes('.env')) return 'env';
+  if (normalized.endsWith('.yaml') || normalized.endsWith('.yml')) return 'yaml';
+  if (normalized.endsWith('.sql')) return 'sql';
+  return 'typescript';
+}
+
+function detectPackageManagerFromRoot(rootPath: string): { name: 'bun' | 'pnpm' | 'yarn' | 'npm'; command: string; reason: string } {
+  const lockCandidates = [
+    ['bun.lock', 'bun', 'bun lockfile'],
+    ['bun.lockb', 'bun', 'bun lockfile'],
+    ['pnpm-lock.yaml', 'pnpm', 'pnpm lockfile'],
+    ['yarn.lock', 'yarn', 'yarn lockfile'],
+    ['package-lock.json', 'npm', 'npm lockfile'],
+    ['npm-shrinkwrap.json', 'npm', 'npm shrinkwrap'],
+  ];
+
+  for (const [fileName, manager, reason] of lockCandidates) {
+    if (fs.existsSync(path.join(rootPath, fileName))) {
+      return { name: manager as 'bun' | 'pnpm' | 'yarn' | 'npm', command: manager, reason };
+    }
+  }
+
+  const pkgJsonPath = path.join(rootPath, 'package.json');
+  if (fs.existsSync(pkgJsonPath)) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8'));
+      const packageManager = typeof pkg.packageManager === 'string' ? pkg.packageManager.split('@')[0] : '';
+      if (packageManager === 'bun' || packageManager === 'pnpm' || packageManager === 'yarn' || packageManager === 'npm') {
+        return { name: packageManager, command: packageManager, reason: 'packageManager field' };
+      }
+    } catch {
+      // ignore invalid package.json
+    }
+  }
+
+  return { name: 'npm', command: 'npm', reason: 'no lockfile or packageManager field; npm fallback' };
+}
+
+function scanProjectRoot(rootPath: string, maxFiles = 400): Array<{ path: string; content: string; lastModified: number }> {
+  const root = path.resolve(rootPath);
+  const collected: Array<{ path: string; content: string; lastModified: number }> = [];
+  const excludedDirs = new Set(['.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.turbo', '.cache', '.venv', 'vendor', '.idea', '.vscode']);
+
+  function walk(current: string): void {
+    if (collected.length >= maxFiles) return;
+    const entries = fs.readdirSync(current, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.name.startsWith('.') && !['.env', '.npmrc', '.yarnrc', '.nvmrc'].includes(entry.name) && !entry.name.startsWith('.env')) {
+        if (entry.isDirectory() && excludedDirs.has(entry.name)) continue;
+      }
+      const fullPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        if (excludedDirs.has(entry.name)) continue;
+        walk(fullPath);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (collected.length >= maxFiles) return;
+      const relativePath = path.relative(root, fullPath).split(path.sep).join('/');
+      if (relativePath === '' || relativePath.startsWith('.git/')) continue;
+      const stat = fs.statSync(fullPath);
+      if (stat.size > 250 * 1024) continue;
+      if (/\.(png|jpg|jpeg|gif|webp|svg|ico|mp4|mov|zip|gz|tar|woff|woff2|ttf|pdf)$/i.test(fullPath)) continue;
+      try {
+        const content = fs.readFileSync(fullPath, 'utf-8');
+        collected.push({ path: relativePath, content, lastModified: stat.mtimeMs });
+      } catch {
+        // ignore unreadable files
+      }
+    }
+  }
+
+  walk(root);
+  return collected;
+}
+
+function analyzeExistingProject(rootPath: string): {
+  rootPath: string;
+  name: string;
+  framework: string;
+  language: string;
+  packageManager: string;
+  scripts: Record<string, string>;
+  buildScript?: string;
+  testScript?: string;
+  lintScript?: string;
+  files: Array<{ path: string; content: string; lastModified: number }>;
+  gitStatus?: string;
+  gitBranch?: string;
+  gitDirty: boolean;
+  description: string;
+  type: 'existing';
+} {
+  const resolvedRoot = path.resolve(rootPath);
+  const packageJsonPath = path.join(resolvedRoot, 'package.json');
+  const packageJson = fs.existsSync(packageJsonPath)
+    ? JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8'))
+    : null;
+
+  const scripts = packageJson?.scripts && typeof packageJson.scripts === 'object' ? packageJson.scripts : {};
+  const manager = detectPackageManagerFromRoot(resolvedRoot);
+  const frameworkHints = [
+    packageJson?.dependencies?.react ? 'React' : '',
+    packageJson?.dependencies?.['react-dom'] ? 'React' : '',
+    packageJson?.dependencies?.next ? 'Next.js' : '',
+    packageJson?.dependencies?.vue ? 'Vue' : '',
+    packageJson?.dependencies?.['@angular/core'] ? 'Angular' : '',
+    packageJson?.dependencies?.express ? 'Express' : '',
+    packageJson?.dependencies?.['@nestjs/core'] ? 'NestJS' : '',
+    packageJson?.dependencies?.['vite'] ? 'Vite' : '',
+  ].filter(Boolean);
+
+  const framework = frameworkHints[0] || (
+    fs.existsSync(path.join(resolvedRoot, 'vite.config.ts')) || fs.existsSync(path.join(resolvedRoot, 'vite.config.js')) ? 'Vite' :
+    fs.existsSync(path.join(resolvedRoot, 'src')) ? 'TypeScript App' : 'Unknown'
+  );
+
+  let gitStatus = '';
+  let gitBranch = 'main';
+  let gitDirty = false;
+  try {
+    const gitResult = spawnSync('git', ['-C', resolvedRoot, 'status', '--short', '--branch'], { encoding: 'utf-8' });
+    if (gitResult.stdout) {
+      gitStatus = gitResult.stdout.trim();
+      gitDirty = gitStatus.includes('??') || / M |M\s|\sM/.test(gitStatus) || gitStatus.includes('ahead') || gitStatus.includes('behind');
+      const branchLine = gitStatus.split('\n').find((line) => line.startsWith('##')) || '';
+      gitBranch = branchLine.replace(/^##\s*/, '').split('...')[0] || 'main';
+    }
+  } catch {
+    // git not available or not a repository
+  }
+
+  const analyzedFiles = scanProjectRoot(resolvedRoot, 500);
+  return {
+    rootPath: resolvedRoot,
+    name: packageJson?.name || path.basename(resolvedRoot),
+    framework,
+    language: packageJson?.type === 'module' || fs.existsSync(path.join(resolvedRoot, 'tsconfig.json')) ? 'TypeScript' : 'JavaScript',
+    packageManager: manager.name,
+    scripts: scripts || {},
+    buildScript: scripts?.build || scripts?.['build:prod'] || undefined,
+    testScript: scripts?.test || scripts?.['test:ci'] || undefined,
+    lintScript: scripts?.lint || scripts?.typecheck || undefined,
+    files: analyzedFiles,
+    gitStatus,
+    gitBranch,
+    gitDirty,
+    description: packageJson?.description || `Imported existing ${framework} project from ${path.basename(resolvedRoot)}.`,
+    type: 'existing',
+  };
 }
 
 function resolveWorkspacePath(projectId: string, relativePath = ''): string {

@@ -382,4 +382,122 @@ npm run dev
       envVariables: Array.isArray(obj.envVariables) ? obj.envVariables : [],
     };
   }
+
+  /**
+   * Import an existing project from a browser-selected local directory without overwriting templates.
+   */
+  public static importProjectFromFiles(
+    files: Array<{ path: string; content: string; lastModified?: number }>,
+    fallbackName = 'Imported Project'
+  ): ProjectConfig {
+    if (!Array.isArray(files) || files.length === 0) {
+      throw new Error('No project files were selected. Please choose a valid local project directory.');
+    }
+
+    const normalized = files
+      .map((file) => {
+        const relativePath = (file.path || '').replace(/^\/+/, '').replace(/\\/g, '/');
+        if (!relativePath || relativePath === '/' || relativePath.startsWith('C:')) return null;
+        const clean = relativePath.split('/').filter(Boolean).join('/');
+        if (!clean) return null;
+        return {
+          path: clean,
+          content: file.content || '',
+          lastModified: typeof file.lastModified === 'number' ? file.lastModified : Date.now(),
+        };
+      })
+      .filter(Boolean) as Array<{ path: string; content: string; lastModified: number }>;
+
+    if (!normalized.length) {
+      throw new Error('No readable files were found in the selected project directory.');
+    }
+
+    const packageJson = normalized.find((f) => f.path.endsWith('package.json'));
+    const inferredRoot = packageJson ? packageJson.path.replace(/\/package\.json$/, '') : normalized[0].path.split('/')[0];
+    const rootName = packageJson?.content ? (() => {
+      try {
+        const parsed = JSON.parse(packageJson.content);
+        return typeof parsed.name === 'string' ? parsed.name : inferredRoot;
+      } catch {
+        return inferredRoot;
+      }
+    })() : inferredRoot || fallbackName;
+
+    const framework = packageJson?.content ? (() => {
+      try {
+        const parsed = JSON.parse(packageJson.content);
+        const deps = { ...parsed.dependencies, ...parsed.devDependencies };
+        if (deps.react || deps['react-dom']) return 'React / Vite / TypeScript';
+        if (deps.express && deps.typescript) return 'Node.js / Express / TypeScript';
+        if (deps.next) return 'Next.js';
+        if (deps.vue) return 'Vue';
+        return parsed.type === 'module' ? 'TypeScript / Node.js' : 'JavaScript / Node.js';
+      } catch {
+        return 'TypeScript / Node.js';
+      }
+    })() : 'TypeScript / Node.js';
+
+    const timestamp = Date.now();
+    const importedFiles: ProjectFile[] = normalized.map((file, index) => ({
+      id: `f-open-${timestamp}-${index}`,
+      path: file.path,
+      name: file.path.split('/').pop() || 'file',
+      language: file.path.endsWith('.json')
+        ? 'json'
+        : file.path.endsWith('.md')
+          ? 'markdown'
+          : file.path.endsWith('.css')
+            ? 'css'
+            : file.path.endsWith('.tsx') || file.path.endsWith('.ts')
+              ? 'typescript'
+              : file.path.endsWith('.jsx') || file.path.endsWith('.js')
+                ? 'javascript'
+                : file.path.endsWith('.html')
+                  ? 'html'
+                  : 'typescript',
+      content: file.content,
+      lastModified: file.lastModified,
+    }));
+
+    return {
+      id: `proj-open-${timestamp}-${Math.random().toString(36).substring(2, 6)}`,
+      name: rootName || fallbackName,
+      tagline: 'Imported existing project workspace',
+      description: `Imported ${normalized.length} files from a local project directory while preserving the original codebase structure.`,
+      framework,
+      branch: 'main',
+      environment: 'development',
+      healthScore: 96,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastActive: timestamp,
+      files: importedFiles,
+      tasks: [
+        {
+          id: `task-open-${timestamp}`,
+          title: `Review imported project: ${rootName || fallbackName}`,
+          description: 'Inspect the imported workspace, verify setup scripts, and confirm the project is ready to run or edit.',
+          status: 'received',
+          priority: 'medium',
+          assignedTo: 'builder-agent',
+          targetFiles: importedFiles.slice(0, 4).map((f) => f.path),
+          createdAt: timestamp,
+          logs: [`Imported ${normalized.length} files from the existing local workspace.`],
+        },
+      ],
+      tests: [],
+      deployments: [],
+      history: [
+        {
+          id: `hist-open-${timestamp}`,
+          timestamp,
+          type: 'milestone',
+          title: `Project "${rootName || fallbackName}" opened from local folder`,
+          description: `Loaded ${normalized.length} files while preserving the original repository structure.`,
+          author: 'User',
+        },
+      ],
+      envVariables: [],
+    };
+  }
 }

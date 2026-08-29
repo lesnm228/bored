@@ -67,6 +67,7 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({
   const [isFetchingBranches, setIsFetchingBranches] = useState(false);
   const [isExecutingImport, setIsExecutingImport] = useState(false);
   const [ghNotice, setGhNotice] = useState<string | null>(null);
+  const directoryInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     GitService.getAuthStatus().then((status) => {
@@ -284,6 +285,46 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({
     }
   };
 
+  const handleDirectoryImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const pickedFiles = Array.from((e.target.files || []) as File[]);
+    if (!pickedFiles.length) return;
+    setImportError(null);
+
+    try {
+      const resolved = await Promise.all(
+        pickedFiles.map(
+          (file: File) =>
+            new Promise<{ path: string; content: string; lastModified: number }>((resolve, reject) => {
+              const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
+              const reader = new FileReader();
+              reader.onload = () => {
+                resolve({
+                  path: relativePath,
+                  content: String(reader.result || ''),
+                  lastModified: file.lastModified || Date.now(),
+                });
+              };
+              reader.onerror = () => reject(new Error(`Failed to read ${file.name}`));
+              reader.readAsText(file as Blob);
+            })
+        )
+      );
+
+      const importedProject = ProjectService.importProjectFromFiles(resolved);
+      if (onImportProject) {
+        onImportProject(importedProject);
+      } else {
+        onCreateProject(importedProject);
+      }
+    } catch (err: any) {
+      setImportError(err.message || 'Failed to open local project directory');
+    } finally {
+      if (directoryInputRef.current) {
+        directoryInputRef.current.value = '';
+      }
+    }
+  };
+
   const templates = [
     {
       name: 'High-Throughput Stream Router',
@@ -315,6 +356,15 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({
         onChange={handleFileUpload}
         className="hidden"
       />
+      <input
+        ref={directoryInputRef}
+        type="file"
+        multiple
+        webkitdirectory="true"
+        directory="true"
+        onChange={handleDirectoryImport}
+        className="hidden"
+      />
 
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-blue-900/40">
@@ -339,6 +389,14 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({
           >
             <Github className="w-3.5 h-3.5 text-amber-400" />
             <span>GitHub Repo</span>
+          </button>
+
+          <button
+            onClick={() => directoryInputRef.current?.click()}
+            className="px-3.5 py-2 rounded-lg bg-[#0a101f] hover:bg-blue-900/40 text-slate-200 border border-blue-900/50 font-semibold text-xs flex items-center gap-1.5 transition-colors"
+          >
+            <FolderGit2 className="w-3.5 h-3.5 text-emerald-400" />
+            <span>Open Folder</span>
           </button>
 
           <button
