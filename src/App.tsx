@@ -713,7 +713,16 @@ export default function App() {
               onRollbackTask={handleRollbackTask}
               onExecuteTaskWithAgent={(task) => {
                 setCurrentView('agent');
-                handleExecuteAgent(task.title);
+                const taskProject = {
+                  ...currentProject,
+                  tasks: currentProject.tasks.map((currentTask) =>
+                    currentTask.id === task.id
+                      ? { ...currentTask, status: 'planning', assignedTo: 'builder-agent' }
+                      : currentTask
+                  ),
+                };
+                handleUpdateProject(taskProject);
+                void handleExecuteAgent(task.title, settings.autonomyLevel, settings.maxStepBudget, taskProject);
               }}
             />
           )}

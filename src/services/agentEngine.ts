@@ -2,6 +2,12 @@ import { ProjectConfig, ProjectFile, TaskItem, TestCase, LogEntry, AgentRunState
 import { buildWorkspaceDependencyGraph, validateWorkspacePath } from './dependencyGraph';
 import { RuntimeService } from './runtimeService';
 
+const resolveApiUrl = (path: string): string => {
+  if (/^https?:\/\//i.test(path)) return path;
+  const origin = typeof window !== 'undefined' && window.location?.origin ? window.location.origin : 'http://127.0.0.1:3000';
+  return path.startsWith('/') ? `${origin}${path}` : `${origin}/${path}`;
+};
+
 export interface AgentExecutionCallbacks {
   onStateChange: (state: AgentRunState) => void;
   onLog: (log: LogEntry) => void;
@@ -48,6 +54,26 @@ export class AutonomousAgentEngine {
     this.listeners.forEach((l) => l(currentState));
   }
 
+  private reconcileTaskUpdate(currentProj: ProjectConfig, updatedTask: TaskItem): ProjectConfig {
+    const taskIndex = currentProj.tasks.findIndex((task) => {
+      if (task.id === updatedTask.id) return true;
+      if (!updatedTask.title || !task.title) return false;
+      return task.title.trim().toLowerCase() === updatedTask.title.trim().toLowerCase();
+    });
+
+    if (taskIndex >= 0) {
+      const nextTasks = [...currentProj.tasks];
+      nextTasks[taskIndex] = { ...nextTasks[taskIndex], ...updatedTask };
+      return { ...currentProj, tasks: nextTasks, updatedAt: Date.now() };
+    }
+
+    return {
+      ...currentProj,
+      tasks: [updatedTask, ...currentProj.tasks],
+      updatedAt: Date.now(),
+    };
+  }
+
   public async runAgentSession(
     goal: string,
     project: ProjectConfig,
@@ -75,11 +101,7 @@ export class AutonomousAgentEngine {
         onProjectUpdate(currentProj);
       },
       onTaskUpdate: (updatedTask) => {
-        const taskExists = currentProj.tasks.some((t) => t.id === updatedTask.id);
-        const newTasks = taskExists
-          ? currentProj.tasks.map((t) => (t.id === updatedTask.id ? updatedTask : t))
-          : [updatedTask, ...currentProj.tasks];
-        currentProj = { ...currentProj, tasks: newTasks, updatedAt: Date.now() };
+        currentProj = this.reconcileTaskUpdate(currentProj, updatedTask);
         onProjectUpdate(currentProj);
       },
       onTestUpdate: (updatedTest) => {
@@ -190,7 +212,7 @@ export class AutonomousAgentEngine {
       };
 
       try {
-        const planRes = await fetch('/api/agent/plan', {
+        const planRes = await fetch(resolveApiUrl('/api/agent/plan'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -259,6 +281,13 @@ export class AutonomousAgentEngine {
           ? taskDef.targetFiles
           : ['src/index.ts'];
 
+        const matchingProjectTask = project.tasks.find((task) => {
+          if (!task.title) return false;
+          const normalizedGoal = goal.trim().toLowerCase();
+          const normalizedTaskTitle = task.title.trim().toLowerCase();
+          return normalizedTaskTitle === normalizedGoal || normalizedTaskTitle.includes(normalizedGoal) || normalizedGoal.includes(normalizedTaskTitle);
+        }) || project.tasks.find((task) => task.status === 'received' && task.targetFiles?.some((file) => targetFilesList.includes(file)));
+
         // Validate security: Ensure all target paths are strictly inside the workspace sandbox
         for (const targetPath of targetFilesList) {
           const pathCheck = validateWorkspacePath(targetPath);
@@ -272,23 +301,23 @@ export class AutonomousAgentEngine {
         // Initialize Task Item with planned files and rollback capability
         runState.activeTask = taskDef.title;
         const newTaskItem: TaskItem = {
-          id: `agent-task-${Date.now()}-${i}`,
-          title: taskDef.title,
-          description: taskDef.description,
+          id: matchingProjectTask?.id || `agent-task-${Date.now()}-${i}`,
+          title: matchingProjectTask?.title || taskDef.title,
+          description: matchingProjectTask?.description || taskDef.description,
           status: 'working',
-          priority: taskDef.priority || 'high',
-          assignedTo: 'builder-agent',
-          targetFiles: targetFilesList,
-          plannedFiles: targetFilesList,
-          modifiedFiles: [],
-          canRollback: true,
-          isRolledBack: false,
-          createdAt: Date.now(),
-          subtasks: taskDef.subtasks?.map((st, sidx) => ({
+          priority: matchingProjectTask?.priority || taskDef.priority || 'high',
+          assignedTo: matchingProjectTask?.assignedTo || 'builder-agent',
+          targetFiles: matchingProjectTask?.targetFiles?.length ? matchingProjectTask.targetFiles : targetFilesList,
+          plannedFiles: matchingProjectTask?.plannedFiles?.length ? matchingProjectTask.plannedFiles : targetFilesList,
+          modifiedFiles: matchingProjectTask?.modifiedFiles || [],
+          canRollback: typeof matchingProjectTask?.canRollback === 'boolean' ? matchingProjectTask.canRollback : true,
+          isRolledBack: matchingProjectTask?.isRolledBack || false,
+          createdAt: matchingProjectTask?.createdAt || Date.now(),
+          subtasks: matchingProjectTask?.subtasks?.length ? matchingProjectTask.subtasks : (taskDef.subtasks?.map((st, sidx) => ({
             id: `sub-${Date.now()}-${sidx}`,
             title: st,
             completed: false,
-          })) || [],
+          })) || []),
         };
         callbacks.onTaskUpdate(newTaskItem);
 
@@ -311,7 +340,7 @@ export class AutonomousAgentEngine {
 
           let newContent = previousContent;
           try {
-            const stepRes = await fetch('/api/agent/execute-step', {
+            const stepRes = await fetch(resolveApiUrl('/api/agent/execute-step'), {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -382,7 +411,7 @@ export class AutonomousAgentEngine {
         let failedFileResults: Array<{ path: string; valid: boolean; errors: string[] }> = [];
 
         try {
-          const valRes = await fetch('/api/workspace/validate', {
+          const valRes = await fetch(resolveApiUrl('/api/workspace/validate'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -441,7 +470,7 @@ export class AutonomousAgentEngine {
               if (!fileInTask) continue;
 
               try {
-                const repairRes = await fetch('/api/agent/repair-step', {
+                const repairRes = await fetch(resolveApiUrl('/api/agent/repair-step'), {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({
@@ -483,7 +512,7 @@ export class AutonomousAgentEngine {
 
             // Re-validate the repaired files with esbuild
             try {
-              const revalRes = await fetch('/api/workspace/validate', {
+              const revalRes = await fetch(resolveApiUrl('/api/workspace/validate'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -618,7 +647,7 @@ export class AutonomousAgentEngine {
         if (repairTargets.length === 0) throw new Error(`BLOCKED: production build failed and no affected files were identified. ${diagnostic.slice(-1200)}`);
         addThought('Self-Correction', `Production build failed; repairing ${repairTargets.length} affected file(s), attempt ${attempt + 1}/3.`, 'action');
         for (const file of repairTargets) {
-          const repairRes = await fetch('/api/agent/repair-step', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filePath: file.path, currentContent: file.content, errors: [diagnostic.slice(-3000)], taskTitle: 'Repair production build', taskDescription: 'Fix the actual generated project build error.', goal }), signal });
+          const repairRes = await fetch(resolveApiUrl('/api/agent/repair-step'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filePath: file.path, currentContent: file.content, errors: [diagnostic.slice(-3000)], taskTitle: 'Repair production build', taskDescription: 'Fix the actual generated project build error.', goal }), signal });
           if (!repairRes.ok) throw new Error(`BLOCKED: repair request failed for ${file.path}.`);
           const repairData = await repairRes.json();
           if (!repairData.repaired || typeof repairData.content !== 'string') throw new Error(`BLOCKED: no repair was produced for ${file.path}.`);
@@ -636,7 +665,7 @@ export class AutonomousAgentEngine {
       addThought('Verification', `Running Vitest test suite against updated workspace runtime...`, 'verification');
 
       try {
-        const testRes = await fetch('/api/workspace/run-tests', {
+        const testRes = await fetch(resolveApiUrl('/api/workspace/run-tests'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
