@@ -828,51 +828,63 @@ function rewriteProjectScopedPreviewUrls(raw: string, projectId: string): string
     .replace(/url\(\s*(["']?)(\/)(?!\/)(?!api\/runtime\/preview\/)/g, `url($1${proxyPrefix}/`);
 }
 
+async function proxyProjectPreview(req: Request, res: Response, projectId: string) {
+  const runtime = runtimeDevProcesses.get(projectId);
+  if (!runtime || runtime.state !== 'RUNNING') { res.status(503).json({ success: false, error: 'Project preview unavailable: dev server is not RUNNING.' }); return; }
+
+  const suffix = req.params[0] || '';
+  const query = req.url.includes('?') ? `?${req.url.split('?')[1]}` : '';
+  const upstreamUrl = `http://127.0.0.1:${runtime.port}/${suffix}${query}`.replace(/\/{2,}/g, '/');
+  const upstream = await fetch(upstreamUrl);
+  const contentType = upstream.headers.get('content-type') || '';
+
+  res.status(upstream.status);
+  upstream.headers.forEach((value, key) => {
+    if (['content-encoding', 'content-length', 'transfer-encoding', 'connection', 'keep-alive', 'etag'].includes(key)) {
+      return;
+    }
+    res.setHeader(key, value);
+  });
+
+  if (!upstream.body) { res.end(); return; }
+
+  const isTextual = contentType.includes('text/html') || contentType.includes('javascript') || contentType.includes('text/css');
+  if (isTextual) {
+    const text = await upstream.text();
+    const rewritten = rewriteProjectScopedPreviewUrls(text, projectId);
+    if (contentType.includes('text/html')) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    } else if (contentType.includes('text/css')) {
+      res.setHeader('Content-Type', 'text/css; charset=utf-8');
+    } else {
+      res.setHeader('Content-Type', 'text/javascript; charset=utf-8');
+    }
+    res.end(rewritten);
+    return;
+  }
+
+  if (typeof Readable.fromWeb === 'function') {
+    const stream = Readable.fromWeb(upstream.body as any);
+    stream.pipe(res);
+    return;
+  }
+
+  const body = Buffer.from(await upstream.arrayBuffer());
+  if (body.length === 0) { res.end(); return; }
+  res.end(body);
+}
+
+app.get('/api/runtime/preview/:projectId', async (req: Request, res: Response) => {
+  try {
+    const projectId = assertProjectId(req.params.projectId);
+    await proxyProjectPreview(req, res, projectId);
+  } catch (error: any) { res.status(502).json({ success: false, error: `Preview unavailable: ${error.message}` }); }
+});
+
 app.get('/api/runtime/preview/:projectId/*', async (req: Request, res: Response) => {
   try {
     const projectId = assertProjectId(req.params.projectId);
-    const runtime = runtimeDevProcesses.get(projectId);
-    if (!runtime || runtime.state !== 'RUNNING') { res.status(503).json({ success: false, error: 'Project preview unavailable: dev server is not RUNNING.' }); return; }
-
-    const suffix = req.params[0] || '';
-    const query = req.url.includes('?') ? `?${req.url.split('?')[1]}` : '';
-    const upstream = await fetch(`http://127.0.0.1:${runtime.port}/${suffix}${query}`);
-    const contentType = upstream.headers.get('content-type') || '';
-
-    res.status(upstream.status);
-    upstream.headers.forEach((value, key) => {
-      if (['content-encoding', 'content-length', 'transfer-encoding', 'connection', 'keep-alive', 'etag'].includes(key)) {
-        return;
-      }
-      res.setHeader(key, value);
-    });
-
-    if (!upstream.body) { res.end(); return; }
-
-    const isTextual = contentType.includes('text/html') || contentType.includes('javascript') || contentType.includes('text/css');
-    if (isTextual) {
-      const text = await upstream.text();
-      const rewritten = rewriteProjectScopedPreviewUrls(text, projectId);
-      if (contentType.includes('text/html')) {
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      } else if (contentType.includes('text/css')) {
-        res.setHeader('Content-Type', 'text/css; charset=utf-8');
-      } else {
-        res.setHeader('Content-Type', 'text/javascript; charset=utf-8');
-      }
-      res.end(rewritten);
-      return;
-    }
-
-    if (typeof Readable.fromWeb === 'function') {
-      const stream = Readable.fromWeb(upstream.body as any);
-      stream.pipe(res);
-      return;
-    }
-
-    const body = Buffer.from(await upstream.arrayBuffer());
-    if (body.length === 0) { res.end(); return; }
-    res.end(body);
+    await proxyProjectPreview(req, res, projectId);
   } catch (error: any) { res.status(502).json({ success: false, error: `Preview unavailable: ${error.message}` }); }
 });
 

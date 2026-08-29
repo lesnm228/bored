@@ -41,6 +41,11 @@ export async function verifyBuilderBoard(): Promise<string> {
   const htmlText = await previewHtml.text();
   assert.match(htmlText, /BUILDER BOARD PREVIEW IS WORKING|src=\"\/api\/runtime\/preview\//i, 'preview HTML should be served by the project-scoped preview proxy');
 
+  const previewRoot = await fetch(`${SERVER_URL}/api/runtime/preview/${projectId}`);
+  assert.equal(previewRoot.status, 200, 'preview project root without trailing slash should resolve to the same project-scoped app');
+  const previewRootText = await previewRoot.text();
+  assert.match(previewRootText, /BUILDER BOARD PREVIEW IS WORKING|src=\"\/api\/runtime\/preview\//i, 'preview root should render the generated app without falling back to bare \/');
+
   const clientResponse = await fetch(`${SERVER_URL}/api/runtime/preview/${projectId}/@vite/client`);
   assert.equal(clientResponse.status, 200, '@vite client should load');
   assert.match(clientResponse.headers.get('content-type') || '', /javascript|text\/plain/i, 'Vite client should be served as JavaScript');
