@@ -1,22 +1,13 @@
 import React, { useState } from 'react';
 import {
-  Sparkles,
-  Play,
-  Square,
-  CheckCircle2,
   AlertCircle,
-  Clock,
-  Code2,
-  FileCode,
-  Layers,
-  FlaskConical,
-  ShieldCheck,
+  CheckCircle2,
+  FolderOpen,
+  Loader2,
+  Play,
   Send,
-  RefreshCw,
-  Terminal,
-  Activity,
-  ChevronRight,
-  HelpCircle,
+  ShieldCheck,
+  Square,
 } from 'lucide-react';
 import { ProjectConfig, AgentRunState, AutonomyLevel } from '../../types';
 import { InstructionBox } from '../InstructionBox';
@@ -24,11 +15,21 @@ import { InstructionBox } from '../InstructionBox';
 interface AgentWorkstationViewProps {
   currentProject: ProjectConfig;
   agentState: AgentRunState;
-  onExecuteAgent: (goal: string, autonomy: AutonomyLevel, maxSteps: number) => void;
+  onExecuteAgent: (
+    goal: string,
+    autonomy: AutonomyLevel,
+    maxSteps: number
+  ) => void;
   onAbortAgent: () => void;
   onRunReview: () => void;
   onOpenFiles: () => void;
 }
+
+type ChatMessage = {
+  sender: 'user' | 'agent';
+  text: string;
+  timestamp: number;
+};
 
 export const AgentWorkstationView: React.FC<AgentWorkstationViewProps> = ({
   currentProject,
@@ -39,15 +40,7 @@ export const AgentWorkstationView: React.FC<AgentWorkstationViewProps> = ({
   onOpenFiles,
 }) => {
   const [chatInput, setChatInput] = useState('');
-  const [chatMessages, setChatMessages] = useState<
-    Array<{ sender: 'user' | 'agent'; text: string; timestamp: number }>
-  >([
-    {
-      sender: 'agent',
-      text: `Autonomous Builder Agent online for project "${currentProject.name}". Ready to architect, write code, run tests, and execute instructions.`,
-      timestamp: Date.now() - 1000 * 60 * 5,
-    },
-  ]);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [isSendingChat, setIsSendingChat] = useState(false);
 
   const isRunning =
@@ -57,303 +50,321 @@ export const AgentWorkstationView: React.FC<AgentWorkstationViewProps> = ({
     agentState.status === 'running_tests' ||
     agentState.status === 'validating';
 
-  const handleSendChat = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!chatInput.trim() || isSendingChat) return;
+  const formatTime = (timestamp: number) =>
+    new Date(timestamp).toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+    });
 
+  const sendChat = async () => {
     const userText = chatInput.trim();
+
+    if (!userText || isSendingChat) return;
+
     setChatInput('');
-    setChatMessages((prev) => [...prev, { sender: 'user', text: userText, timestamp: Date.now() }]);
+    setChatMessages((prev) => [
+      ...prev,
+      {
+        sender: 'user',
+        text: userText,
+        timestamp: Date.now(),
+      },
+    ]);
+
     setIsSendingChat(true);
 
     try {
       const res = await fetch('/api/agent/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+        },
         body: JSON.stringify({
           message: userText,
-          projectContext: `${currentProject.name}: ${currentProject.description}. Files: ${currentProject.files.map((f) => f.path).join(', ')}`,
+          projectContext: `${currentProject.name}: ${
+            currentProject.description
+          }. Files: ${currentProject.files.map((file) => file.path).join(', ')}`,
         }),
       });
 
-      if (res.ok) {
-        const data = await res.json();
+      if (!res.ok) {
         setChatMessages((prev) => [
           ...prev,
-          { sender: 'agent', text: data.reply || 'Acknowledged.', timestamp: Date.now() },
+          {
+            sender: 'agent',
+            text: `Agent request failed with HTTP ${res.status}. No successful result was recorded.`,
+            timestamp: Date.now(),
+          },
         ]);
-      } else {
-        setChatMessages((prev) => [
-          ...prev,
-          { sender: 'agent', text: 'Processing complete for active project state.', timestamp: Date.now() },
-        ]);
+        return;
       }
+
+      const data = await res.json();
+
+      setChatMessages((prev) => [
+        ...prev,
+        {
+          sender: 'agent',
+          text:
+            typeof data.reply === 'string' && data.reply.trim()
+              ? data.reply
+              : 'The agent service returned no response.',
+          timestamp: Date.now(),
+        },
+      ]);
     } catch {
       setChatMessages((prev) => [
         ...prev,
-        { sender: 'agent', text: 'Telemetry confirmed. All project files in sync.', timestamp: Date.now() },
+        {
+          sender: 'agent',
+          text: 'Unable to reach the agent service. No task completion was recorded.',
+          timestamp: Date.now(),
+        },
       ]);
     } finally {
       setIsSendingChat(false);
     }
   };
 
+  const handleChatKeyDown = (
+    event: React.KeyboardEvent<HTMLTextAreaElement>
+  ) => {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      void sendChat();
+    }
+  };
+
   return (
-    <div className="flex-1 flex flex-col lg:flex-row h-full overflow-y-auto lg:overflow-hidden bg-[#020617] text-slate-100 font-sans p-6 gap-6 relative">
-      {/* Left Column: Build Engine & Instructions */}
-      <div className="flex-1 flex flex-col gap-6">
-        {/* Current Project Header & Controls */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-          <div>
-            <div className="text-xs text-slate-500 uppercase tracking-widest font-mono">Current Project</div>
-            <div className="text-2xl font-bold text-slate-100 flex items-center gap-2 mt-0.5">
-              <span>{currentProject.name}</span>
-              <span className="text-[10px] px-2 py-0.5 bg-blue-900/30 border border-blue-500/30 text-blue-400 rounded-full font-mono uppercase">
+    <div className="flex-1 min-h-0 flex flex-col bg-[#020617] text-slate-100">
+      <div className="border-b border-slate-800 bg-[#07111f] px-4 sm:px-6 py-4">
+        <div className="max-w-5xl mx-auto flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0">
+            <div className="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-medium">
+              Current Project
+            </div>
+
+            <div className="flex items-center gap-2 mt-1 min-w-0">
+              <h1 className="text-base sm:text-lg font-semibold text-slate-100 truncate">
+                {currentProject.name}
+              </h1>
+
+              <span className="shrink-0 rounded border border-blue-800 px-2 py-0.5 text-[10px] uppercase tracking-wide text-blue-300">
                 {currentProject.framework}
               </span>
             </div>
-            <p className="text-xs text-slate-400 mt-1 max-w-xl">{currentProject.description}</p>
+
+            {currentProject.description && (
+              <p className="mt-1 text-xs sm:text-sm text-slate-400 line-clamp-2">
+                {currentProject.description}
+              </p>
+            )}
           </div>
 
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-2">
             {isRunning ? (
               <button
+                type="button"
                 onClick={onAbortAgent}
-                className="flex items-center gap-2 px-6 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white font-bold text-xs transition-all shadow-lg shadow-red-900/20 active:scale-95 animate-pulse"
+                className="inline-flex items-center gap-2 rounded-md border border-red-700 bg-red-950/40 px-3 py-2 text-xs font-semibold text-red-300 hover:bg-red-950/70"
               >
-                <Square className="w-3.5 h-3.5 fill-white" />
-                <span>ABORT BUILD</span>
+                <Square className="w-3.5 h-3.5 fill-current" />
+                Stop
               </button>
             ) : (
               <button
-                onClick={() => onExecuteAgent(currentProject.description, 'fully_autonomous', 12)}
-                className="flex items-center gap-2 px-6 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs transition-all shadow-lg shadow-amber-500/10 active:scale-95"
+                type="button"
+                onClick={() =>
+                  onExecuteAgent(
+                    currentProject.description,
+                    'fully_autonomous',
+                    12
+                  )
+                }
+                className="inline-flex items-center gap-2 rounded-md bg-amber-400 px-3 py-2 text-xs font-bold text-slate-950 hover:bg-amber-300"
               >
-                <Play className="w-3.5 h-3.5 fill-slate-950" />
-                <span>RUN ENGINE</span>
+                <Play className="w-3.5 h-3.5 fill-current" />
+                Run
               </button>
             )}
 
             <button
+              type="button"
               onClick={onRunReview}
-              className="px-4 py-2 rounded-lg bg-[#0a101f] hover:bg-blue-900/40 border border-blue-900/60 text-slate-300 text-xs font-semibold flex items-center gap-1.5 transition-colors"
+              className="inline-flex items-center gap-2 rounded-md border border-slate-700 px-3 py-2 text-xs font-semibold text-slate-300 hover:bg-slate-800"
             >
-              <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-              <span>Audit</span>
+              <ShieldCheck className="w-3.5 h-3.5" />
+              Audit
+            </button>
+
+            <button
+              type="button"
+              onClick={onOpenFiles}
+              className="inline-flex items-center gap-2 rounded-md border border-slate-700 px-3 py-2 text-xs font-semibold text-slate-300 hover:bg-slate-800"
+            >
+              <FolderOpen className="w-3.5 h-3.5" />
+              Files
             </button>
           </div>
-        </div>
-
-        {/* Central Glass Card: Workflow & Agent Instructions */}
-        <div className="flex-1 bg-[#0a101f]/80 backdrop-blur-md border border-blue-900/50 rounded-2xl p-6 flex flex-col justify-between gap-6">
-          <div>
-            <div className="flex items-center justify-between mb-6 pb-2 border-b border-blue-900/30">
-              <div className="text-sm font-bold text-amber-500 uppercase tracking-widest flex items-center gap-2">
-                <Sparkles className="w-4 h-4 text-amber-400" />
-                <span>Build Workflow Progress</span>
-              </div>
-              <div className="text-xs text-blue-400 font-mono">
-                Status: <span className="text-amber-300 font-bold uppercase">{agentState.status.replace('_', ' ')}</span>
-              </div>
-            </div>
-
-            {/* Step-by-Step Progress Timeline */}
-            <div className="space-y-4">
-              {/* Step 1: Validation */}
-              <div className="flex items-center gap-4">
-                <div className="w-8 h-8 rounded-full border-2 border-blue-500 flex items-center justify-center shrink-0 bg-blue-500/10 text-blue-400 shadow-[0_0_8px_rgba(59,130,246,0.3)]">
-                  <CheckCircle2 className="w-4 h-4" />
-                </div>
-                <div className="flex-1">
-                  <div className="flex justify-between text-xs mb-1">
-                    <span className="font-semibold text-slate-200">1. Environment Validation</span>
-                    <span className="text-blue-400 font-mono font-bold">100%</span>
-                  </div>
-                  <div className="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
-                    <div className="bg-blue-500 h-full rounded-full shadow-[0_0_8px_rgba(59,130,246,0.5)] w-full"></div>
-                  </div>
-                </div>
-              </div>
-
-              {/* Step 2: Architecture / Synthesis */}
-              <div className="flex items-center gap-4">
-                <div
-                  className={`w-8 h-8 rounded-full border-2 flex items-center justify-center shrink-0 ${
-                    isRunning
-                      ? 'border-amber-500 bg-amber-500/10 animate-pulse'
-                      : agentState.status === 'completed'
-                      ? 'border-blue-500 bg-blue-500/10 text-blue-400'
-                      : 'border-amber-500/80 bg-amber-500/5'
-                  }`}
-                >
-                  {agentState.status === 'completed' ? (
-                    <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                  ) : (
-                    <div className="w-2 h-2 rounded-full bg-amber-500 shadow-[0_0_10px_#fbbf24]"></div>
-                  )}
-                </div>
-                <div className="flex-1">
-                  <div className="flex justify-between text-xs mb-1">
-                    <span className="font-semibold text-slate-200">2. Autonomous Synthesis & Implementation</span>
-                    <span className="text-amber-400 font-mono font-bold">
-                      {agentState.status === 'completed'
-                        ? '100%'
-                        : isRunning
-                        ? `${Math.round(Math.max(25, (agentState.currentStepIndex / (agentState.totalSteps || 1)) * 100))}%`
-                        : '85%'}
-                    </span>
-                  </div>
-                  <div className="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
-                    <div
-                      className="bg-amber-500 h-full rounded-full shadow-[0_0_8px_#fbbf24] transition-all duration-300"
-                      style={{
-                        width:
-                          agentState.status === 'completed'
-                            ? '100%'
-                            : isRunning
-                            ? `${Math.max(25, (agentState.currentStepIndex / (agentState.totalSteps || 1)) * 100)}%`
-                            : '85%',
-                      }}
-                    ></div>
-                  </div>
-                </div>
-              </div>
-
-              {/* Step 3: Test Verification */}
-              <div className="flex items-center gap-4">
-                <div
-                  className={`w-8 h-8 rounded-full border-2 flex items-center justify-center shrink-0 ${
-                    agentState.status === 'completed'
-                      ? 'border-emerald-500 text-emerald-400 bg-emerald-500/10'
-                      : 'border-slate-700 bg-slate-900/50'
-                  }`}
-                >
-                  {agentState.status === 'completed' ? (
-                    <CheckCircle2 className="w-4 h-4" />
-                  ) : (
-                    <span className="text-[11px] text-slate-500 font-mono">3</span>
-                  )}
-                </div>
-                <div className="flex-1">
-                  <div className="flex justify-between text-xs mb-1">
-                    <span className="text-slate-400">3. Vitest Regression Matrix</span>
-                    <span className="text-slate-500 font-mono">
-                      {agentState.status === 'completed' ? 'Passed' : 'Pending'}
-                    </span>
-                  </div>
-                  <div className="w-full bg-slate-800 h-1.5 rounded-full">
-                    <div
-                      className="bg-emerald-500 h-full rounded-full shadow-[0_0_8px_#22c55e]"
-                      style={{ width: agentState.status === 'completed' ? '100%' : '0%' }}
-                    ></div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Embedded Instruction Box */}
-          <InstructionBox
-            onExecute={onExecuteAgent}
-            onAbort={onAbortAgent}
-            isRunning={isRunning}
-            activeGoal={agentState.currentGoal}
-          />
         </div>
       </div>
 
-      {/* Right Column: System Output Logs & Validation Metrics */}
-      <div className="w-full lg:w-96 flex flex-col gap-6 shrink-0">
-        {/* System Output Logs Card */}
-        <div className="flex-1 bg-[#030816] border border-blue-900/50 rounded-2xl overflow-hidden flex flex-col min-h-[300px]">
-          {/* Top Title Bar with Colored Dots */}
-          <div className="bg-[#0a101f] px-4 py-2.5 border-b border-blue-900/50 flex items-center justify-between">
-            <span className="text-xs font-bold text-slate-300 font-mono tracking-wider uppercase flex items-center gap-2">
-              <Terminal className="w-3.5 h-3.5 text-amber-400" />
-              <span>System Output Logs</span>
-            </span>
-            <div className="flex gap-1.5">
-              <span className="w-2.5 h-2.5 rounded-full bg-red-500/80"></span>
-              <span className="w-2.5 h-2.5 rounded-full bg-amber-500/80"></span>
-              <span className="w-2.5 h-2.5 rounded-full bg-green-500/80"></span>
-            </div>
-          </div>
-
-          {/* Thought & Telemetry Feed */}
-          <div className="p-4 flex-1 font-mono text-xs overflow-y-auto space-y-2 select-text">
-            {agentState.thoughtLog.length === 0 ? (
-              <div className="text-slate-500 text-center py-10">
-                [SYSTEM READY] Listening on websocket://node.eagle.internal:3000...
-              </div>
-            ) : (
-              agentState.thoughtLog.map((log, idx) => (
-                <div key={idx} className="leading-relaxed">
-                  <span className="text-slate-500 select-none mr-2">
-                    {new Date(log.timestamp).toLocaleTimeString()}
-                  </span>
-                  <span
-                    className={
-                      log.type === 'action'
-                        ? 'text-amber-400 font-bold'
-                        : log.type === 'verification'
-                        ? 'text-emerald-400 font-bold'
-                        : 'text-blue-400'
-                    }
-                  >
-                    [{log.phase.toUpperCase()}]
-                  </span>{' '}
-                  <span className="text-slate-300">{log.message}</span>
+      <div className="flex-1 min-h-0 overflow-y-auto">
+        <div className="max-w-5xl mx-auto px-4 sm:px-6 py-6 sm:py-8">
+          {chatMessages.length === 0 && (
+            <div className="py-10 sm:py-14">
+              <div className="max-w-2xl">
+                <div className="w-10 h-10 rounded-md bg-amber-400 flex items-center justify-center text-slate-950 font-black text-sm">
+                  BB
                 </div>
-              ))
+
+                <h2 className="mt-4 text-xl sm:text-2xl font-semibold text-slate-100">
+                  What do you want to build?
+                </h2>
+
+                <p className="mt-2 text-sm leading-6 text-slate-400">
+                  Describe the change you want. Builder Board will use the
+                  connected project and agent services. Runtime results and
+                  failures are shown only when the underlying system reports
+                  them.
+                </p>
+              </div>
+            </div>
+          )}
+
+          <div className="space-y-6">
+            {chatMessages.map((message, index) => (
+              <div
+                key={`${message.timestamp}-${index}`}
+                className={`flex ${
+                  message.sender === 'user'
+                    ? 'justify-end'
+                    : 'justify-start'
+                }`}
+              >
+                <div
+                  className={`max-w-[92%] sm:max-w-[82%] ${
+                    message.sender === 'user'
+                      ? 'rounded-lg bg-blue-700 px-4 py-3 text-white'
+                      : 'border-l-2 border-amber-400 pl-4 py-1 text-slate-200'
+                  }`}
+                >
+                  <div className="whitespace-pre-wrap break-words text-sm leading-6">
+                    {message.text}
+                  </div>
+
+                  <div
+                    className={`mt-2 text-[10px] ${
+                      message.sender === 'user'
+                        ? 'text-blue-200'
+                        : 'text-slate-500'
+                    }`}
+                  >
+                    {message.sender === 'user' ? 'You' : 'Builder Board'} ·{' '}
+                    {formatTime(message.timestamp)}
+                  </div>
+                </div>
+              </div>
+            ))}
+
+            {isSendingChat && (
+              <div className="flex items-center gap-2 border-l-2 border-amber-400 pl-4 text-sm text-slate-400">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                Waiting for agent response…
+              </div>
+            )}
+
+            {(agentState.currentGoal || agentState.status) && (
+              <section className="border border-slate-800 rounded-lg bg-[#07111f]">
+                <div className="flex items-center justify-between gap-4 px-4 py-3 border-b border-slate-800">
+                  <div className="text-xs font-semibold text-slate-200">
+                    Execution status
+                  </div>
+
+                  <div className="text-[10px] uppercase tracking-wide text-amber-300">
+                    {String(agentState.status).replace(/_/g, ' ')}
+                  </div>
+                </div>
+
+                <div className="px-4 py-4 space-y-3">
+                  {agentState.currentGoal && (
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wide text-slate-500">
+                        Current goal
+                      </div>
+                      <div className="mt-1 text-sm text-slate-300">
+                        {agentState.currentGoal}
+                      </div>
+                    </div>
+                  )}
+
+                  {agentState.totalSteps > 0 && (
+                    <div className="flex items-center gap-2 text-xs text-slate-400">
+                      {agentState.status === 'completed' ? (
+                        <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                      ) : isRunning ? (
+                        <Loader2 className="w-4 h-4 animate-spin text-amber-300" />
+                      ) : (
+                        <AlertCircle className="w-4 h-4 text-slate-500" />
+                      )}
+
+                      <span>
+                        Step {agentState.currentStepIndex} of{' '}
+                        {agentState.totalSteps}
+                      </span>
+                    </div>
+                  )}
+
+                  <p className="text-[11px] leading-5 text-slate-500">
+                    This section reflects the real agent state supplied by the
+                    existing Builder Board runtime. No synthetic completion
+                    percentage is generated here.
+                  </p>
+                </div>
+              </section>
             )}
           </div>
-
-          {/* Dialogue Form with Agent */}
-          <form onSubmit={handleSendChat} className="p-3 border-t border-blue-900/50 bg-[#0a101f] flex gap-2">
-            <input
-              type="text"
-              value={chatInput}
-              onChange={(e) => setChatInput(e.target.value)}
-              placeholder="Directive or query to Agent..."
-              className="flex-1 bg-[#030816] border border-blue-900/60 rounded-lg px-3 py-1.5 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-amber-500"
-            />
-            <button
-              type="submit"
-              disabled={!chatInput.trim() || isSendingChat}
-              className="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-slate-950 font-bold text-xs transition-colors"
-            >
-              <Send className="w-3.5 h-3.5" />
-            </button>
-          </form>
         </div>
+      </div>
 
-        {/* Validation Metrics Card */}
-        <div className="h-44 bg-[#0a101f] border border-blue-900/50 rounded-2xl p-4 flex flex-col justify-between">
-          <div className="text-xs font-bold text-slate-400 uppercase tracking-wider flex items-center justify-between">
-            <span>Validation Metrics</span>
-            <span className="text-[10px] text-emerald-400 font-mono flex items-center gap-1">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-              Live Sync
-            </span>
+      <div className="border-t border-slate-800 bg-[#07111f]">
+        <div className="max-w-5xl mx-auto px-4 sm:px-6 py-4">
+          <div className="flex items-end gap-2 rounded-lg border border-slate-700 bg-[#020617] p-2 focus-within:border-amber-500">
+            <textarea
+              value={chatInput}
+              onChange={(event) => setChatInput(event.target.value)}
+              onKeyDown={handleChatKeyDown}
+              rows={1}
+              placeholder="Message Builder Board…"
+              className="min-h-[44px] max-h-36 flex-1 resize-none bg-transparent px-3 py-2 text-sm text-slate-100 placeholder:text-slate-600 outline-none"
+            />
+
+            <button
+              type="button"
+              onClick={() => void sendChat()}
+              disabled={!chatInput.trim() || isSendingChat}
+              className="h-10 w-10 shrink-0 rounded-md bg-amber-400 text-slate-950 flex items-center justify-center disabled:cursor-not-allowed disabled:opacity-40 hover:bg-amber-300"
+              aria-label="Send message"
+            >
+              {isSendingChat ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Send className="w-4 h-4" />
+              )}
+            </button>
           </div>
 
-          <div className="grid grid-cols-2 gap-2 mt-2">
-            <div className="bg-[#030816] p-2.5 rounded-lg border border-blue-900/20">
-              <div className="text-[10px] text-slate-500 uppercase">Code Quality</div>
-              <div className="text-base font-bold text-emerald-400 font-mono">98.2%</div>
-            </div>
-            <div className="bg-[#030816] p-2.5 rounded-lg border border-blue-900/20">
-              <div className="text-[10px] text-slate-500 uppercase">Coverage</div>
-              <div className="text-base font-bold text-blue-400 font-mono">84.7%</div>
-            </div>
-            <div className="bg-[#030816] p-2.5 rounded-lg border border-blue-900/20">
-              <div className="text-[10px] text-slate-500 uppercase">Threat Score</div>
-              <div className="text-base font-bold text-slate-200 font-mono">0.02</div>
-            </div>
-            <div className="bg-[#030816] p-2.5 rounded-lg border border-blue-900/20">
-              <div className="text-[10px] text-slate-500 uppercase">Health Score</div>
-              <div className="text-base font-bold text-amber-400 font-mono">{currentProject.healthScore}%</div>
-            </div>
+          <div className="mt-2 text-[10px] text-slate-600">
+            Enter to send · Shift+Enter for a new line
+          </div>
+
+          <div className="mt-4 border-t border-slate-800 pt-4">
+            <InstructionBox
+              onExecute={onExecuteAgent}
+              onAbort={onAbortAgent}
+              isRunning={isRunning}
+              activeGoal={agentState.currentGoal}
+            />
           </div>
         </div>
       </div>
