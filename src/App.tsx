@@ -32,6 +32,27 @@ import { TerminalView } from './components/views/TerminalView';
 import { PreviewView } from './components/views/PreviewView';
 import { OutputLogsDrawer } from './components/OutputLogsDrawer';
 
+const readStoredSettings = (): WorkspaceSettings => {
+  try {
+    const saved = localStorage.getItem('builder_board_settings');
+    if (!saved) return defaultSettings;
+
+    const parsed = JSON.parse(saved);
+    if (!parsed || typeof parsed !== 'object') return defaultSettings;
+
+    return {
+      ...defaultSettings,
+      ...parsed,
+      autonomyLevel: parsed.autonomyLevel === 'supervised' || parsed.autonomyLevel === 'semi_autonomous' || parsed.autonomyLevel === 'fully_autonomous'
+        ? parsed.autonomyLevel
+        : defaultSettings.autonomyLevel,
+      maxStepBudget: typeof parsed.maxStepBudget === 'number' ? parsed.maxStepBudget : defaultSettings.maxStepBudget,
+    };
+  } catch {
+    return defaultSettings;
+  }
+};
+
 export default function App() {
   const [currentView, setCurrentView] = useState<WorkspaceView>('landing');
   const [projects, setProjects] = useState<ProjectConfig[]>(() => {
@@ -41,8 +62,7 @@ export default function App() {
     return ProjectService.getActiveProjectId(ProjectService.loadProjects());
   });
   const [settings, setSettings] = useState<WorkspaceSettings>(() => {
-    const saved = localStorage.getItem('builder_board_settings');
-    return saved ? JSON.parse(saved) : defaultSettings;
+    return readStoredSettings();
   });
   const [logs, setLogs] = useState<BuildLogEntry[]>([]);
   const [logsOpen, setLogsOpen] = useState(false);
