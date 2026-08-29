@@ -1,4 +1,4 @@
-import { ProjectConfig, ProjectFile, TaskItem } from '../types';
+import { ProjectConfig, ProjectContext, ProjectFile, TaskItem } from '../types';
 import { initialProjects } from '../data/initialData';
 
 const STORAGE_KEY_PROJECTS = 'builder_board_projects_v3';
@@ -297,6 +297,28 @@ npm run dev
       ],
     };
 
+    const projectContext = {
+      isExistingProject: false,
+      framework,
+      language: 'TypeScript',
+      packageManager: 'npm',
+      scripts: {
+        dev: 'npm run dev',
+        build: 'npm run build',
+        test: 'npm test',
+      },
+      buildScript: 'npm run build',
+      testScript: 'npm test',
+      lintScript: 'npm run lint',
+      projectStructure: ['src'],
+      gitBranch: 'main',
+      gitStatus: '',
+      gitDirty: false,
+      runtimeStartCommand: 'npm run dev',
+      source: 'generated' as const,
+      generatedAt: timestamp,
+    };
+
     return {
       id: `proj-${timestamp}-${Math.random().toString(36).substring(2, 7)}`,
       name: cleanName,
@@ -336,6 +358,69 @@ npm run dev
         { key: 'PORT', value: '3000', isSecret: false },
         { key: 'NODE_ENV', value: 'development', isSecret: false },
       ],
+      projectContext,
+    };
+  }
+
+  public static analyzeProjectFiles(files: Array<{ path: string; content: string }>, fallbackName = 'Imported Project'): ProjectContext {
+    const packageJson = files.find((file) => file.path === 'package.json' || file.path.endsWith('/package.json'));
+    const scripts: Record<string, string> = {};
+    let packageManager = 'npm';
+    let framework = 'Unknown';
+    let language = 'Unknown';
+    let buildScript: string | undefined;
+    let testScript: string | undefined;
+    let lintScript: string | undefined;
+    let runtimeStartCommand = 'npm run dev';
+
+    if (packageJson) {
+      try {
+        const parsed = JSON.parse(packageJson.content || '{}') as any;
+        if (parsed.name) fallbackName = parsed.name;
+        if (parsed.packageManager) {
+          packageManager = String(parsed.packageManager).startsWith('npm') ? 'npm' : String(parsed.packageManager).split('@')[0];
+        }
+        if (parsed.scripts && typeof parsed.scripts === 'object') {
+          Object.entries(parsed.scripts).forEach(([key, value]) => {
+            if (typeof value === 'string') {
+              scripts[key] = value;
+            }
+          });
+          buildScript = scripts.build;
+          testScript = scripts.test;
+          lintScript = scripts.lint || scripts.typecheck;
+          if (scripts.dev) runtimeStartCommand = `${packageManager} run dev`;
+          else if (scripts.start) runtimeStartCommand = `${packageManager} run start`;
+        }
+        const deps = { ...(parsed.dependencies || {}), ...(parsed.devDependencies || {}) };
+        if (deps.react || deps['react-dom']) framework = 'React / Vite / TypeScript';
+        else if (deps.express) framework = 'Node.js / Express / TypeScript';
+        else if (deps.next) framework = 'Next.js';
+        else if (deps.vue) framework = 'Vue';
+        else if (parsed.type === 'module') framework = 'TypeScript / Node.js';
+        if (parsed.type === 'module' || files.some((file) => file.path.endsWith('.ts') || file.path.endsWith('.tsx'))) language = 'TypeScript';
+        else if (files.some((file) => file.path.endsWith('.js') || file.path.endsWith('.jsx'))) language = 'JavaScript';
+      } catch {
+        // ignore malformed package.json and fall back to file-based detection
+      }
+    }
+
+    const rootEntries = Array.from(new Set(files.map((file) => file.path.split('/')[0]).filter(Boolean))).slice(0, 12);
+    const projectStructure = rootEntries.length ? rootEntries : ['src'];
+
+    return {
+      isExistingProject: true,
+      framework,
+      language,
+      packageManager,
+      scripts,
+      buildScript,
+      testScript,
+      lintScript,
+      projectStructure,
+      runtimeStartCommand,
+      source: 'imported',
+      generatedAt: Date.now(),
     };
   }
 
@@ -352,19 +437,22 @@ npm run dev
     }
 
     const timestamp = Date.now();
+    const projectFiles = Array.isArray(obj.files) ? obj.files : [];
+    const derivedContext = ProjectService.analyzeProjectFiles(projectFiles, String(obj.name || 'Imported Project'));
+
     return {
       id: `proj-import-${timestamp}-${Math.random().toString(36).substring(2, 6)}`,
       name: String(obj.name),
       tagline: String(obj.tagline || 'Imported Workspace'),
       description: String(obj.description || 'Imported into Builder Board'),
-      framework: String(obj.framework || 'TypeScript / Node.js'),
+      framework: String(obj.framework || derivedContext.framework || 'TypeScript / Node.js'),
       branch: String(obj.branch || 'main'),
       environment: 'development',
       healthScore: typeof obj.healthScore === 'number' ? obj.healthScore : 95,
       createdAt: typeof obj.createdAt === 'number' ? obj.createdAt : timestamp,
       updatedAt: timestamp,
       lastActive: timestamp,
-      files: Array.isArray(obj.files) ? obj.files : [],
+      files: projectFiles,
       tasks: Array.isArray(obj.tasks) ? obj.tasks : [],
       tests: Array.isArray(obj.tests) ? obj.tests : [],
       deployments: Array.isArray(obj.deployments) ? obj.deployments : [],
@@ -380,6 +468,7 @@ npm run dev
         },
       ],
       envVariables: Array.isArray(obj.envVariables) ? obj.envVariables : [],
+      projectContext: derivedContext,
     };
   }
 
@@ -459,12 +548,14 @@ npm run dev
       lastModified: file.lastModified,
     }));
 
+    const projectContext = ProjectService.analyzeProjectFiles(normalized, rootName || fallbackName);
+
     return {
       id: `proj-open-${timestamp}-${Math.random().toString(36).substring(2, 6)}`,
       name: rootName || fallbackName,
       tagline: 'Imported existing project workspace',
       description: `Imported ${normalized.length} files from a local project directory while preserving the original codebase structure.`,
-      framework,
+      framework: projectContext.framework || framework,
       branch: 'main',
       environment: 'development',
       healthScore: 96,
@@ -498,6 +589,7 @@ npm run dev
         },
       ],
       envVariables: [],
+      projectContext,
     };
   }
 }

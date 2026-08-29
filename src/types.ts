@@ -147,6 +147,24 @@ export interface TerminalSession {
   events: TerminalEvent[];
 }
 
+export interface ProjectContext {
+  isExistingProject: boolean;
+  framework?: string;
+  language?: string;
+  packageManager?: string;
+  scripts?: Record<string, string>;
+  buildScript?: string;
+  testScript?: string;
+  lintScript?: string;
+  projectStructure?: string[];
+  gitBranch?: string;
+  gitStatus?: string;
+  gitDirty?: boolean;
+  runtimeStartCommand?: string;
+  source: 'generated' | 'imported';
+  generatedAt: number;
+}
+
 export interface ProjectConfig {
   id: string;
   name: string;
@@ -181,6 +199,7 @@ export interface ProjectConfig {
     lastSyncedCommitSha?: string;
   };
   gitBaselineFiles?: { path: string; content: string }[];
+  projectContext?: ProjectContext;
 }
 
 export interface AgentRuntimeEvidence {

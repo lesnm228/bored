@@ -138,10 +138,15 @@ export default function App() {
   };
 
   const handleImportProject = (importedProject: ProjectConfig) => {
-    setProjects((prev) => [importedProject, ...prev]);
-    setCurrentProjectId(importedProject.id);
+    const normalizedProject = {
+      ...importedProject,
+      projectContext: importedProject.projectContext ?? ProjectService.analyzeProjectFiles(importedProject.files, importedProject.name),
+      updatedAt: Date.now(),
+    };
+    setProjects((prev) => [normalizedProject, ...prev]);
+    setCurrentProjectId(normalizedProject.id);
     setCurrentView('agent');
-    appendLog(`Imported project workspace: "${importedProject.name}".`, 'success', 'WORKSPACE');
+    appendLog(`Imported project workspace: "${normalizedProject.name}".`, 'success', 'WORKSPACE');
   };
 
   const handleDeleteProject = (projectId: string) => {
@@ -185,6 +190,13 @@ export default function App() {
 
   const handleAbortAgent = () => {
     globalAgentEngine.abort();
+    const activeTaskId = agentState.activeTask || currentProject.tasks.find((task) => task.status === 'working' || task.status === 'planning' || task.status === 'validating')?.id;
+    if (activeTaskId) {
+      const nextTasks = currentProject.tasks.map((task) =>
+        task.id === activeTaskId ? { ...task, status: 'aborted' as const, completedAt: Date.now() } : task
+      );
+      handleUpdateProject({ ...currentProject, tasks: nextTasks, updatedAt: Date.now() });
+    }
     appendLog('Agent execution forcibly aborted by operator.', 'warn', 'OPERATOR');
   };
 

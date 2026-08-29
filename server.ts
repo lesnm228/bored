@@ -144,6 +144,51 @@ app.get('/api/health', (_req: Request, res: Response) => {
   });
 });
 
+app.post('/api/workspace/analyze', (req: Request, res: Response) => {
+  try {
+    const { projectId, files, rootPath } = req.body || {};
+    const sourceFiles = Array.isArray(files) ? files : [];
+    const workspaceRoot = typeof rootPath === 'string' && rootPath.trim() ? rootPath : (sourceFiles.length > 0 ? prepareWorkspaceDirectory(String(projectId || 'analyze-project'), sourceFiles, false) : undefined);
+    const root = workspaceRoot || (typeof projectId === 'string' ? prepareWorkspaceDirectory(projectId, [], false) : undefined);
+    if (!root && sourceFiles.length === 0) {
+      throw new Error('Project analysis requires either files or a workspace root path.');
+    }
+    const analysis = root ? analyzeExistingProject(root) : {
+      rootPath: path.resolve(process.cwd()),
+      name: 'Imported project',
+      framework: 'Unknown',
+      language: 'Unknown',
+      packageManager: 'npm',
+      scripts: {},
+      files: Array.isArray(sourceFiles) ? sourceFiles.map((file: any) => ({ path: String(file.path || 'unknown'), content: String(file.content || ''), lastModified: Date.now() })) : [],
+      gitStatus: '',
+      gitBranch: 'main',
+      gitDirty: false,
+      description: 'Project context derived from imported files.',
+      type: 'existing' as const,
+    };
+    res.json({ success: true, projectContext: {
+      isExistingProject: true,
+      framework: analysis.framework,
+      language: analysis.language,
+      packageManager: analysis.packageManager,
+      scripts: analysis.scripts || {},
+      buildScript: analysis.buildScript,
+      testScript: analysis.testScript,
+      lintScript: analysis.lintScript,
+      projectStructure: analysis.files.slice(0, 10).map((file) => file.path.split('/')[0]).filter(Boolean).slice(0, 8),
+      gitBranch: analysis.gitBranch,
+      gitStatus: analysis.gitStatus,
+      gitDirty: analysis.gitDirty,
+      runtimeStartCommand: analysis.scripts?.dev ? `${analysis.packageManager} run dev` : analysis.scripts?.start ? `${analysis.packageManager} run start` : `${analysis.packageManager} run start`,
+      source: 'imported',
+      generatedAt: Date.now(),
+    }});
+  } catch (error: any) {
+    res.status(400).json({ success: false, error: error.message || 'Project analysis failed.' });
+  }
+});
+
 // Workspace Persistence REST Endpoints
 app.get('/api/workspaces', (_req: Request, res: Response) => {
   const store = readPersistedWorkspaces();
