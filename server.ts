@@ -780,9 +780,8 @@ app.post('/api/runtime/dev/start', async (req: Request, res: Response) => {
       runtimePorts.delete(port);
       port = allocateRuntimePort(projectId, port + 1);
     }
-    const previewBase = `/api/runtime/preview/${encodeURIComponent(projectId)}/`;
     const env = { ...safeRuntimeEnv(), PORT: String(port) };
-    const session = spawnRuntimeSession(projectId, workspace, configured.manager.command, ['run', configured.script, '--', '--host', '127.0.0.1', '--port', String(port), '--base', previewBase], env);
+    const session = spawnRuntimeSession(projectId, workspace, configured.manager.command, ['run', configured.script, '--', '--host', '127.0.0.1', '--port', String(port)], env);
     const runtime: RuntimeDevRecord = { projectId, sessionId: session.id, process: activeTerminalProcesses.get(session.id)?.process || ({} as ChildProcess), pid: activeTerminalProcesses.get(session.id)?.process.pid, port, startedAt: Date.now(), state: 'STARTING' };
     runtimeDevProcesses.set(projectId, runtime);
     try {
@@ -831,19 +830,36 @@ app.get('/api/runtime/preview/:projectId/*', async (req: Request, res: Response)
     const suffix = req.params[0] || '';
     const query = req.url.includes('?') ? `?${req.url.split('?')[1]}` : '';
     const upstream = await fetch(`http://127.0.0.1:${runtime.port}/${suffix}${query}`);
+    const contentType = upstream.headers.get('content-type') || '';
 
     res.status(upstream.status);
     upstream.headers.forEach((value, key) => {
-      if (key !== 'content-encoding' && key !== 'content-length' && key !== 'etag') {
-        res.setHeader(key, value);
+      if (['content-encoding', 'content-length', 'transfer-encoding', 'connection', 'keep-alive', 'etag'].includes(key)) {
+        return;
       }
+      res.setHeader(key, value);
     });
 
     if (!upstream.body) { res.end(); return; }
 
+    if (contentType.includes('text/html')) {
+      const html = await upstream.text();
+      const proxyPrefix = `/api/runtime/preview/${encodeURIComponent(projectId)}`;
+      const rewritten = html.replace(/(src|href)=(['"])(\/)(?!\/)/g, `$1=$2${proxyPrefix}/`);
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.end(rewritten);
+      return;
+    }
+
+    if (typeof Readable.fromWeb === 'function') {
+      const stream = Readable.fromWeb(upstream.body as any);
+      stream.pipe(res);
+      return;
+    }
+
     const body = Buffer.from(await upstream.arrayBuffer());
     if (body.length === 0) { res.end(); return; }
-    res.send(body);
+    res.end(body);
   } catch (error: any) { res.status(502).json({ success: false, error: `Preview unavailable: ${error.message}` }); }
 });
 
