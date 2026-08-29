@@ -821,6 +821,10 @@ app.post('/api/runtime/dev/stop/:projectId', (req: Request, res: Response) => {
   } catch (error: any) { res.status(400).json({ success: false, error: error.message }); }
 });
 
+function rewritePreviewUrls(content: string, previewPrefix: string): string {
+  return content.replace(/(["'(=])\/(?!\/|api\/|api\/runtime\/preview\/)/g, `$1${previewPrefix}`);
+}
+
 app.get('/api/runtime/preview/:projectId/*', async (req: Request, res: Response) => {
   try {
     const projectId = assertProjectId(req.params.projectId);
@@ -829,9 +833,16 @@ app.get('/api/runtime/preview/:projectId/*', async (req: Request, res: Response)
     const suffix = req.params[0] || '';
     const upstream = await fetch(`http://127.0.0.1:${runtime.port}/${suffix}${req.url.includes('?') ? `?${req.url.split('?')[1]}` : ''}`);
     res.status(upstream.status);
-    upstream.headers.forEach((value, key) => { if (key !== 'content-encoding') res.setHeader(key, value); });
-    if (upstream.body) Readable.fromWeb(upstream.body as any).pipe(res);
-    else res.end();
+    const contentType = upstream.headers.get('content-type') || '';
+    const shouldRewrite = /text\/html|javascript|text\/css/.test(contentType);
+    upstream.headers.forEach((value, key) => {
+      if (key !== 'content-encoding' && !(shouldRewrite && (key === 'content-length' || key === 'etag'))) res.setHeader(key, value);
+    });
+    if (!upstream.body) { res.end(); return; }
+    if (!shouldRewrite) { Readable.fromWeb(upstream.body as any).pipe(res); return; }
+    const body = Buffer.from(await upstream.arrayBuffer());
+    const previewPrefix = `/api/runtime/preview/${encodeURIComponent(projectId)}/`;
+    res.send(rewritePreviewUrls(body.toString('utf-8'), previewPrefix));
   } catch (error: any) { res.status(502).json({ success: false, error: `Preview unavailable: ${error.message}` }); }
 });
 
