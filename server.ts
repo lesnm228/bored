@@ -735,7 +735,7 @@ function spawnRuntimeSession(projectId: string, workspace: string, executable: s
 }
 
 function safeRuntimeEnv(): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { NODE_ENV: 'development', PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR };
+  const env: NodeJS.ProcessEnv = { NODE_ENV: 'development', DISABLE_HMR: 'true', PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR };
   return env;
 }
 
@@ -822,7 +822,9 @@ app.post('/api/runtime/dev/stop/:projectId', (req: Request, res: Response) => {
 });
 
 function rewritePreviewUrls(content: string, previewPrefix: string): string {
-  return content.replace(/(["'(=])\/(?!\/|api\/|api\/runtime\/preview\/)/g, `$1${previewPrefix}`);
+  return content
+    .replace(/<script\b[^>]*\bsrc=["']\/\@vite\/client["'][^>]*><\/script>/gi, '')
+    .replace(/(["'(=])\/(?!\/|api\/|api\/runtime\/preview\/)/g, `$1${previewPrefix}`);
 }
 
 app.get('/api/runtime/preview/:projectId/*', async (req: Request, res: Response) => {
