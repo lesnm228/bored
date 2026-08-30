@@ -306,6 +306,44 @@ interface RuntimeDevRecord {
 const runtimeDevProcesses = new Map<string, RuntimeDevRecord>();
 const runtimePorts = new Map<number, string>();
 
+function waitForProcessExit(pid: number | undefined, timeoutMs = 5000): Promise<void> {
+  if (typeof pid !== 'number' || pid <= 0) return Promise.resolve();
+
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve) => {
+    const poll = () => {
+      try {
+        process.kill(pid, 0);
+      } catch (error: any) {
+        if (error && error.code === 'ESRCH') return resolve();
+      }
+
+      if (Date.now() >= deadline) return resolve();
+      setTimeout(poll, 100);
+    };
+    poll();
+  });
+}
+
+async function stopRuntimeSession(projectId: string): Promise<RuntimeDevRecord | null> {
+  const runtime = runtimeDevProcesses.get(projectId);
+  if (!runtime) return null;
+
+  const targetPid = runtime.pid || runtime.process?.pid;
+  if (typeof targetPid === 'number' && targetPid > 0) {
+    if (process.platform !== 'win32') {
+      try { process.kill(-targetPid, 'SIGTERM'); } catch (error: any) { if (error && error.code !== 'ESRCH') throw error; }
+    }
+    try { runtime.process?.kill('SIGTERM'); } catch (error: any) { if (error && error.code !== 'ESRCH') throw error; }
+    await waitForProcessExit(targetPid, 5000);
+  }
+
+  runtime.state = 'STOPPED';
+  runtimePorts.delete(runtime.port);
+  runtimeDevProcesses.delete(projectId);
+  return runtime;
+}
+
 function redactTerminalSecrets(text: string): string {
   if (!text) return '';
   let sanitized = text;
@@ -349,7 +387,12 @@ function validateCommandSandbox(commandStr: string, requestedDir?: string): {
     return { allowed: false, executable: '', args: [], reason: 'Malformed command input.' };
   }
 
-  const rawExec = tokens[0].replace(/^["']|["']$/g, '');
+  const firstToken = tokens[0];
+  if (!firstToken) {
+    return { allowed: false, executable: '', args: [], reason: 'Malformed command input.' };
+  }
+
+  const rawExec = firstToken.replace(/^["']|["']$/g, '');
   const executable = path.basename(rawExec);
   const args = tokens.slice(1).map((t) => t.replace(/^["']|["']$/g, ''));
 
@@ -693,6 +736,23 @@ function allocateRuntimePort(projectId: string, requested?: number): number {
   throw new Error('No managed runtime port is available.');
 }
 
+function buildRuntimeSpawn(workspace: string, scriptName: 'dev' | 'build' | 'lint' | 'typecheck' | 'test', port: number): { executable: string; args: string[] } {
+  const packageJsonPath = path.join(workspace, 'package.json');
+  if (!fs.existsSync(packageJsonPath)) throw new Error('Missing package.json for runtime launch.');
+
+  let packageJson: any;
+  try { packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8')); } catch { throw new Error('Could not parse package.json for runtime launch.'); }
+
+  const scriptText = typeof packageJson?.scripts?.[scriptName] === 'string' ? packageJson.scripts[scriptName] : '';
+  const viteBinary = path.join(workspace, 'node_modules', '.bin', process.platform === 'win32' ? 'vite.cmd' : 'vite');
+  if (scriptText.includes('vite') && fs.existsSync(viteBinary)) {
+    return { executable: viteBinary, args: ['--host', '127.0.0.1', '--port', String(port), '--strictPort'] };
+  }
+
+  const configured = getConfiguredScript(workspace, scriptName);
+  return { executable: configured.manager.command, args: ['run', configured.script, '--', '--host', '127.0.0.1', '--port', String(port), '--strictPort'] };
+}
+
 async function waitForHttpReady(port: number, timeoutMs = 15000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -771,29 +831,40 @@ app.post('/api/runtime/command', (req: Request, res: Response) => {
 app.post('/api/runtime/dev/start', async (req: Request, res: Response) => {
   try {
     const projectId = assertProjectId(req.body.projectId);
-    const existing = runtimeDevProcesses.get(projectId);
-    if (existing && existing.state === 'RUNNING') { res.json({ success: true, runtime: { ...existing, process: undefined } }); return; }
     const workspace = materializeProjectWorkspace(projectId, req.body.files);
-    const configured = getConfiguredScript(workspace, 'dev');
+    const existing = runtimeDevProcesses.get(projectId);
+    if (existing) {
+      await stopRuntimeSession(projectId);
+    }
+
     let port = allocateRuntimePort(projectId, req.body.port);
     while (!(await isPortAvailable(port))) {
       runtimePorts.delete(port);
       port = allocateRuntimePort(projectId, port + 1);
     }
+
     const env = { ...safeRuntimeEnv(), PORT: String(port) };
-    const session = spawnRuntimeSession(projectId, workspace, configured.manager.command, ['run', configured.script, '--', '--host', '127.0.0.1', '--port', String(port)], env);
-    const runtime: RuntimeDevRecord = { projectId, sessionId: session.id, process: activeTerminalProcesses.get(session.id)?.process || ({} as ChildProcess), pid: activeTerminalProcesses.get(session.id)?.process.pid, port, startedAt: Date.now(), state: 'STARTING' };
+    const runtimeCommand = buildRuntimeSpawn(workspace, 'dev', port);
+    const session = spawnRuntimeSession(projectId, workspace, runtimeCommand.executable, runtimeCommand.args, env);
+    const runtime: RuntimeDevRecord = {
+      projectId,
+      sessionId: session.id,
+      process: activeTerminalProcesses.get(session.id)?.process || ({} as ChildProcess),
+      pid: activeTerminalProcesses.get(session.id)?.process.pid,
+      port,
+      startedAt: Date.now(),
+      state: 'STARTING',
+    };
     runtimeDevProcesses.set(projectId, runtime);
+
     try {
       await waitForHttpReady(port);
       runtime.state = 'RUNNING';
       res.json({ success: true, runtime: { ...runtime, process: undefined }, readiness: 'PASS' });
     } catch (error: any) {
-      runtime.state = 'FAILED'; runtime.error = error.message;
-      const failed = activeTerminalProcesses.get(session.id);
-      if (failed?.process.pid && process.platform !== 'win32') process.kill(-failed.process.pid, 'SIGTERM'); else failed?.process.kill('SIGTERM');
-      runtimePorts.delete(port);
-      runtimeDevProcesses.delete(projectId);
+      runtime.state = 'FAILED';
+      runtime.error = error.message;
+      await stopRuntimeSession(projectId);
       res.status(502).json({ success: false, runtime: { ...runtime, process: undefined }, error: error.message });
     }
   } catch (error: any) { res.status(error.message === 'NOT CONFIGURED' ? 422 : 400).json({ success: false, error: error.message }); }
@@ -804,19 +875,18 @@ app.get('/api/runtime/dev/status/:projectId', (req: Request, res: Response) => {
   catch (error: any) { res.status(400).json({ success: false, error: error.message }); }
 });
 
-app.post('/api/runtime/dev/stop/:projectId', (req: Request, res: Response) => {
+app.post('/api/runtime/dev/stop/:projectId', async (req: Request, res: Response) => {
   try {
     const projectId = assertProjectId(req.params.projectId);
     const runtime = runtimeDevProcesses.get(projectId);
     if (!runtime) { res.json({ success: true, state: 'STOPPED', message: 'No running project server.' }); return; }
+
     const active = activeTerminalProcesses.get(runtime.sessionId);
     if (active) {
       active.session.status = 'cancelled';
-      if (active.process.pid && process.platform !== 'win32') process.kill(-active.process.pid, 'SIGTERM'); else active.process.kill('SIGTERM');
     }
-    runtime.state = 'STOPPED';
-    runtimePorts.delete(runtime.port);
-    runtimeDevProcesses.delete(projectId);
+
+    await stopRuntimeSession(projectId);
     res.json({ success: true, state: 'STOPPED', projectId });
   } catch (error: any) { res.status(400).json({ success: false, error: error.message }); }
 });
