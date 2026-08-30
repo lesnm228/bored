@@ -443,14 +443,12 @@ function prepareWorkspaceDirectory(projectId: string, files?: Array<{ path: stri
     fs.mkdirSync(workspacePath, { recursive: true });
   }
 
-  // Symlink node_modules if not present
-  const rootNodeModules = path.join(process.cwd(), 'node_modules');
   const targetNodeModules = path.join(workspacePath, 'node_modules');
-  if (fs.existsSync(rootNodeModules) && !fs.existsSync(targetNodeModules)) {
+  if (fs.existsSync(targetNodeModules) && fs.lstatSync(targetNodeModules).isSymbolicLink()) {
     try {
-      fs.symlinkSync(rootNodeModules, targetNodeModules, 'junction');
+      fs.unlinkSync(targetNodeModules);
     } catch {
-      // ignore
+      // ignore stale symlink cleanup failures
     }
   }
 
@@ -756,10 +754,21 @@ function buildRuntimeSpawn(workspace: string, scriptName: 'dev' | 'build' | 'lin
 async function waitForHttpReady(port: number, timeoutMs = 15000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    try { const response = await fetch(`http://127.0.0.1:${port}`, { signal: AbortSignal.timeout(500) }); if (response.status < 500) return; } catch { /* process is still starting */ }
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}`, { signal: AbortSignal.timeout(500) });
+      if (response.ok) return;
+      if (response.status >= 500) {
+        throw new Error(`HTTP error ${response.status} from preview server.`);
+      }
+    } catch (error: any) {
+      if (error && typeof error.message === 'string' && error.message.startsWith('HTTP error')) {
+        throw error;
+      }
+      // process is still starting, retry until the timeout expires
+    }
     await new Promise((resolve) => setTimeout(resolve, 150));
   }
-  throw new Error(`HTTP readiness check failed on port ${port}.`);
+  throw new Error(`HTTP readiness check failed on port ${port}: server never returned a real 2xx response.`);
 }
 
 function isPortAvailable(port: number): Promise<boolean> {

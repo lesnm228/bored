@@ -15,6 +15,7 @@ import { ProjectService } from './services/projectService';
 import { globalAgentEngine } from './services/agentEngine';
 import { exportProjectZip, exportProjectJson, exportAuditTrail } from './services/exportService';
 import { TerminalService } from './services/terminalService';
+import { RuntimeService } from './services/runtimeService';
 
 // Component views
 import { LandingPage } from './components/LandingPage';
@@ -650,17 +651,27 @@ export default function App() {
 
   const handleStartRuntime = async () => {
     setRuntime({ state: 'STARTING' });
-    appendLog('Starting the generated project dev server...', 'info', 'RUNTIME');
+    appendLog('Preparing generated project workspace...', 'info', 'RUNTIME');
     try {
-      const res = await fetch('/api/runtime/dev/start', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectId: currentProject.id, files: currentProject.files }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Dev server failed to start.');
-      setRuntime(data.runtime);
-      appendLog(`HTTP readiness passed on port ${data.runtime.port}. Real preview is available.`, 'success', 'RUNTIME');
+      const prepared = await RuntimeService.prepare(currentProject.id, currentProject.files);
+      appendLog(`Workspace ready at ${prepared.workspace || currentProject.id}.`, 'info', 'RUNTIME');
+
+      const installResponse = await RuntimeService.install(currentProject.id, currentProject.files);
+      if (!installResponse.session) throw new Error('Dependency installation did not return a session.');
+      const installResult = await RuntimeService.waitForSession(currentProject.id, installResponse.session.id);
+      if (installResult.status !== 'completed' || installResult.exitCode !== 0) {
+        throw new Error(`Dependency installation failed (exit code ${installResult.exitCode ?? 'unknown'}). ${installResult.events.map((event) => event.text).join(' ').slice(-1200)}`);
+      }
+      appendLog('Dependencies installed successfully.', 'success', 'RUNTIME');
+
+      const startResponse = await RuntimeService.startDev(currentProject.id, currentProject.files);
+      if (!startResponse.runtime || startResponse.runtime.state !== 'RUNNING' || startResponse.readiness !== 'PASS') {
+        throw new Error(startResponse.error || 'Dev server failed HTTP readiness and never reached RUNNING.');
+      }
+      setRuntime(startResponse.runtime);
+      appendLog(`HTTP readiness passed on port ${startResponse.runtime.port}. Real preview is available.`, 'success', 'RUNTIME');
+
+      await RuntimeService.checkPreview(currentProject.id);
       await syncRuntimeStatus();
     } catch (error: any) {
       setRuntime({ state: 'FAILED' });
