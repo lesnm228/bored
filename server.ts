@@ -444,9 +444,12 @@ function prepareWorkspaceDirectory(projectId: string, files?: Array<{ path: stri
   }
 
   const targetNodeModules = path.join(workspacePath, 'node_modules');
-  if (fs.existsSync(targetNodeModules) && fs.lstatSync(targetNodeModules).isSymbolicLink()) {
+  if (fs.existsSync(targetNodeModules)) {
     try {
-      fs.unlinkSync(targetNodeModules);
+      const stats = fs.lstatSync(targetNodeModules);
+      if (stats.isSymbolicLink()) {
+        fs.unlinkSync(targetNodeModules);
+      }
     } catch {
       // ignore stale symlink cleanup failures
     }
@@ -756,12 +759,12 @@ async function waitForHttpReady(port: number, timeoutMs = 15000): Promise<void> 
   while (Date.now() < deadline) {
     try {
       const response = await fetch(`http://127.0.0.1:${port}`, { signal: AbortSignal.timeout(500) });
-      if (response.ok) return;
-      if (response.status >= 500) {
-        throw new Error(`HTTP error ${response.status} from preview server.`);
+      if (!response.ok) {
+        throw new Error(`HTTP readiness failed on port ${port}: server responded ${response.status} ${response.statusText || 'error'}.`);
       }
+      return;
     } catch (error: any) {
-      if (error && typeof error.message === 'string' && error.message.startsWith('HTTP error')) {
+      if (error && typeof error.message === 'string' && error.message.startsWith('HTTP readiness failed on port')) {
         throw error;
       }
       // process is still starting, retry until the timeout expires
