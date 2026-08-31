@@ -101,6 +101,51 @@ export class TerminalService {
   /**
    * Cancel an active terminal execution session
    */
+  public static async executeAndWait(
+    options: ExecuteCommandOptions
+  ): Promise<{ session: TerminalSession; cancel: () => Promise<boolean> }> {
+    return new Promise(async (resolve, reject) => {
+      let settled = false;
+      try {
+        const result = await this.executeCommand({
+          ...options,
+          onFinished: (session) => {
+            options.onFinished?.(session);
+            if (!settled) {
+              settled = true;
+              resolve({ session, cancel: result.cancel });
+            }
+          },
+        });
+        if (['completed', 'failed', 'cancelled'].includes(result.session.status)) {
+          settled = true;
+          resolve(result);
+        } else if (typeof EventSource === 'undefined') {
+          const poll = async () => {
+            if (settled) return;
+            const sessions = await this.fetchSessions(options.projectId);
+            const current = sessions.find((session) => session.id === result.session.id);
+            if (current && ['completed', 'failed', 'cancelled'].includes(current.status)) {
+              settled = true;
+              resolve({ session: current, cancel: result.cancel });
+              return;
+            }
+            setTimeout(poll, 250);
+          };
+          void poll();
+        }
+      } catch (error) {
+        if (!settled) {
+          settled = true;
+          reject(error);
+        }
+      }
+    });
+  }
+
+  /**
+   * Cancel an active terminal execution session
+   */
   public static async cancelExecution(sessionId: string): Promise<boolean> {
     try {
       const res = await fetch(`/api/terminal/cancel/${encodeURIComponent(sessionId)}`, {
