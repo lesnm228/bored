@@ -18,6 +18,7 @@ export const PreviewView: React.FC<PreviewViewProps> = ({ currentProject, runtim
 
   useEffect(() => {
     setPreviewError(false);
+    if (runtime?.state === 'RUNNING') setReloadKey((k) => k + 1);
   }, [previewUrl, runtime?.state]);
 
   const handleRetry = () => {
@@ -92,7 +93,7 @@ export const PreviewView: React.FC<PreviewViewProps> = ({ currentProject, runtim
           <div className="w-full h-full rounded-xl overflow-hidden border border-blue-900/40 bg-white">
             <iframe
               key={reloadKey}
-              src={previewUrl}
+              src={`${previewUrl}?reload=${reloadKey}`}
               title="Live project preview"
               className="w-full h-full border-0"
               sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
