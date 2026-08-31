@@ -924,13 +924,14 @@ function buildRuntimePreviewUrl(projectId: string): string {
   return `/api/runtime/preview/${encodeURIComponent(projectId)}/`;
 }
 
-function createRuntimeEnvironment(): NodeJS.ProcessEnv {
+function createRuntimeEnvironment(port?: number): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     PATH: process.env.PATH,
     HOME: process.env.HOME,
     TMPDIR: process.env.TMPDIR,
     NODE_ENV: 'development',
+    PORT: port ? String(port) : process.env.PORT || '4173',
   };
   delete env.GITHUB_TOKEN;
   delete env.GEMINI_API_KEY;
@@ -1080,7 +1081,7 @@ function spawnProjectRuntime(projectId: string, workspaceRoot: string, port: num
   const commandArgs = args.length > 0 ? args : validation.args;
   const child = spawn(validation.executable, commandArgs, {
     cwd: workspaceRoot,
-    env: createRuntimeEnvironment(),
+    env: createRuntimeEnvironment(port),
     shell: false,
   });
 

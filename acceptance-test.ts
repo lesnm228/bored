@@ -102,6 +102,29 @@ async function verifyManualPreviewFlow(): Promise<void> {
   assert.match(html, /MANUAL FLOW OK|<div id="root">/i, 'manual preview should return the generated app HTML');
 }
 
+async function verifyNodeRuntimePortIsolation(): Promise<void> {
+  const projectId = `preview-port-isolation-${Date.now()}`;
+  const files = [
+    { path: 'package.json', content: JSON.stringify({ name: 'preview-port-isolation', private: true, version: '1.0.0', type: 'module', scripts: { dev: 'node server.js' }, dependencies: { express: '^4.21.2' } }, null, 2) },
+    { path: 'server.js', content: "import http from 'node:http';\nconst port = Number(process.env.PORT || 3000);\nconst server = http.createServer((req, res) => { res.statusCode = 200; res.end(`PORT=${port}`); });\nserver.listen(port, '127.0.0.1', () => console.log(`ready:${port}`));\n" },
+  ];
+
+  const start = await request<{ success: boolean; runtime?: { state: string; port?: number } }>(`${SERVER_URL}/api/runtime/dev/start`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ projectId, files, port: 4173 }),
+  });
+
+  assert.equal(start.success, true, 'node runtime should start with its own allocated preview port');
+  assert.equal(start.runtime?.state, 'RUNNING', 'node runtime should become RUNNING');
+  assert.notEqual(start.runtime?.port, 3000, 'node runtime should not reuse the Builder Board port');
+
+  const preview = await fetch(`${SERVER_URL}/api/runtime/preview/${projectId}/`);
+  assert.equal(preview.status, 200, 'generated preview should resolve over the project-scoped proxy');
+  const text = await preview.text();
+  assert.match(text, /PORT=4\d{3}/, 'preview content should originate from the runtime port assigned via PORT env');
+}
+
 async function verifyNoHostNodeModulesSymlink(): Promise<void> {
   const projectId = `preview-no-symlink-${Date.now()}`;
   const files = [
@@ -159,6 +182,7 @@ async function verifyPreviewRestartLifecycle(): Promise<void> {
 export async function verifyBuilderBoard(): Promise<string> {
   await verify404ReadinessFailure();
   await verifyManualPreviewFlow();
+  await verifyNodeRuntimePortIsolation();
   await verifyNoHostNodeModulesSymlink();
   await verifyPreviewRestartLifecycle();
 
