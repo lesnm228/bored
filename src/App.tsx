@@ -740,7 +740,7 @@ export default function App() {
       />
 
       {/* Main Workspace Body */}
-      <div className="flex-1 flex overflow-hidden">
+      <div className="flex-1 flex flex-col md:flex-row overflow-hidden">
         {/* Left Navigation Rail */}
         <Sidebar
           currentView={currentView}
@@ -750,7 +750,7 @@ export default function App() {
         />
 
         {/* Dynamic Center View Container */}
-        <main className="flex-1 flex flex-col overflow-hidden bg-[#020617]">
+        <main className="flex-1 min-w-0 flex flex-col overflow-hidden bg-[#020617]">
           {currentView === 'agent' && (
             <AgentWorkstationView
               currentProject={currentProject}
