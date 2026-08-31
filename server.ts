@@ -756,22 +756,26 @@ function buildRuntimeSpawn(workspace: string, scriptName: 'dev' | 'build' | 'lin
 
 async function waitForHttpReady(port: number, timeoutMs = 15000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
+  const paths = ['/', '/health'];
+
   while (Date.now() < deadline) {
-    try {
-      const response = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(500) });
-      if (!response.ok) {
-        throw new Error(`HTTP readiness failed on port ${port}: server responded ${response.status} ${response.statusText || 'error'}.`);
+    for (const pathname of paths) {
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}${pathname}`, {
+          signal: AbortSignal.timeout(500),
+        });
+        if (response.ok) return;
+      } catch {
+        // process may still be starting; try the next probe and retry until timeout
       }
-      return;
-    } catch (error: any) {
-      if (error && typeof error.message === 'string' && error.message.startsWith('HTTP readiness failed on port')) {
-        throw error;
-      }
-      // process is still starting, retry until the timeout expires
     }
+
     await new Promise((resolve) => setTimeout(resolve, 150));
   }
-  throw new Error(`HTTP readiness check failed on port ${port}: server never returned a real 2xx response.`);
+
+  throw new Error(
+    `HTTP readiness check failed on port ${port}: neither / nor /health returned a real 2xx response.`,
+  );
 }
 
 function isPortAvailable(port: number): Promise<boolean> {
