@@ -331,7 +331,7 @@ async function stopRuntimeSession(projectId: string): Promise<RuntimeDevRecord |
 
   const targetPid = runtime.pid || runtime.process?.pid;
   if (typeof targetPid === 'number' && targetPid > 0) {
-    if (process.platform !== 'win32') {
+    if (process.platform !== 'win32' && process.env.PREFIX?.includes('com.termux') !== true) {
       try { process.kill(-targetPid, 'SIGTERM'); } catch (error: any) { if (error && error.code !== 'ESRCH') throw error; }
     }
     try { runtime.process?.kill('SIGTERM'); } catch (error: any) { if (error && error.code !== 'ESRCH') throw error; }
@@ -758,7 +758,7 @@ async function waitForHttpReady(port: number, timeoutMs = 15000): Promise<void> 
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(`http://127.0.0.1:${port}`, { signal: AbortSignal.timeout(500) });
+      const response = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(500) });
       if (!response.ok) {
         throw new Error(`HTTP readiness failed on port ${port}: server responded ${response.status} ${response.statusText || 'error'}.`);
       }
@@ -783,12 +783,18 @@ function isPortAvailable(port: number): Promise<boolean> {
 }
 
 function spawnRuntimeSession(projectId: string, workspace: string, executable: string, args: string[], env: NodeJS.ProcessEnv): TerminalSessionRecord {
+  const termuxNpmCli = process.env.PREFIX ? path.join(process.env.PREFIX, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js') : '';
+  if (process.env.PREFIX?.includes('com.termux') === true && executable === 'npm' && fs.existsSync(termuxNpmCli)) {
+    executable = process.execPath;
+    args = [termuxNpmCli, ...args];
+  }
+
   const sessionId = `runtime-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
   const session: TerminalSessionRecord = { id: sessionId, projectId, command: [executable, ...args].join(' '), workingDirectory: workspace, status: 'running', startedAt: Date.now(), events: [] };
   const emit = (event: TerminalSessionRecord['events'][number] & { exitCode?: number | null; status?: TerminalSessionRecord['status'] }) => { session.events.push(event); broadcastTerminalEvent(sessionId, event); };
   emit({ type: 'system', text: `[RUNTIME] Executing ${session.command}`, timestamp: Date.now() });
   let child: ChildProcess;
-  try { child = spawn(executable, args, { cwd: workspace, env, shell: false, detached: process.platform !== 'win32' }); }
+  try { child = spawn(executable, args, { cwd: workspace, env, shell: false, detached: process.platform !== 'win32' && process.env.PREFIX?.includes('com.termux') !== true }); }
   catch (error: any) { session.status = 'failed'; session.exitCode = 1; session.finishedAt = Date.now(); emit({ type: 'stderr', text: `Failed to spawn process: ${error.message}`, timestamp: Date.now() }); completedTerminalSessions.set(sessionId, session); return session; }
   activeTerminalProcesses.set(sessionId, { process: child, session });
   child.stdout?.on('data', (chunk: Buffer) => emit({ type: 'stdout', text: redactTerminalSecrets(chunk.toString()), timestamp: Date.now() }));
@@ -807,7 +813,7 @@ function spawnRuntimeSession(projectId: string, workspace: string, executable: s
 }
 
 function safeRuntimeEnv(): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { NODE_ENV: 'development', DISABLE_HMR: 'true', PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR };
+  const env: NodeJS.ProcessEnv = { NODE_ENV: 'development', DISABLE_HMR: 'true', PATH: [path.dirname(process.execPath), process.env.PATH].filter(Boolean).join(path.delimiter), HOME: process.env.HOME, TMPDIR: process.env.TMPDIR, PREFIX: process.env.PREFIX, LD_PRELOAD: process.env.LD_PRELOAD, TERMUX_EXEC__PROC_SELF_EXE: process.env.TERMUX_EXEC__PROC_SELF_EXE };
   return env;
 }
 
@@ -1002,6 +1008,7 @@ app.post('/api/terminal/execute', (req: Request, res: Response) => {
   const workspaceRoot = prepareWorkspaceDirectory(projectId, files);
   const targetCwd = subDir ? path.join(workspaceRoot, subDir.replace(/\.\.\//g, '')) : workspaceRoot;
 
+
   const sessionId = `exec-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
   const session: TerminalSessionRecord = {
     id: sessionId,
@@ -1024,9 +1031,9 @@ app.post('/api/terminal/execute', (req: Request, res: Response) => {
   const safeEnv: NodeJS.ProcessEnv = {
     ...process.env,
     NODE_ENV: 'development',
-    PATH: process.env.PATH,
+    PATH: [path.dirname(process.execPath), process.env.PATH].filter(Boolean).join(path.delimiter),
     HOME: process.env.HOME,
-    TMPDIR: process.env.TMPDIR,
+    TMPDIR: process.env.TMPDIR, PREFIX: process.env.PREFIX, LD_PRELOAD: process.env.LD_PRELOAD, TERMUX_EXEC__PROC_SELF_EXE: process.env.TERMUX_EXEC__PROC_SELF_EXE,
   };
   delete safeEnv.GITHUB_TOKEN;
   delete safeEnv.GEMINI_API_KEY;
