@@ -758,7 +758,7 @@ async function waitForHttpReady(port: number, timeoutMs = 15000): Promise<void> 
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(500) });
+      const response = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(500) });
       if (!response.ok) {
         throw new Error(`HTTP readiness failed on port ${port}: server responded ${response.status} ${response.statusText || 'error'}.`);
       }
