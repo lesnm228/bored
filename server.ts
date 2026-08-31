@@ -1,8 +1,9 @@
 import express, { Request, Response } from 'express';
 import path from 'path';
 import fs from 'fs';
+import net from 'node:net';
 import vm from 'node:vm';
-import { spawn, ChildProcess } from 'node:child_process';
+import { spawn, ChildProcess, execSync } from 'node:child_process';
 import * as esbuild from 'esbuild';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
@@ -368,6 +369,8 @@ interface TerminalSessionRecord {
     type: 'stdout' | 'stderr' | 'system' | 'exit';
     text: string;
     timestamp: number;
+    exitCode?: number | null;
+    status?: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
   }>;
 }
 
@@ -486,14 +489,15 @@ function prepareWorkspaceDirectory(projectId: string, files?: Array<{ path: stri
     fs.mkdirSync(workspacePath, { recursive: true });
   }
 
-  // Symlink node_modules if not present
-  const rootNodeModules = path.join(process.cwd(), 'node_modules');
   const targetNodeModules = path.join(workspacePath, 'node_modules');
-  if (fs.existsSync(rootNodeModules) && !fs.existsSync(targetNodeModules)) {
+  if (fs.existsSync(targetNodeModules)) {
     try {
-      fs.symlinkSync(rootNodeModules, targetNodeModules, 'junction');
+      const stats = fs.lstatSync(targetNodeModules);
+      if (stats.isSymbolicLink() || stats.isDirectory() || stats.isFile()) {
+        fs.rmSync(targetNodeModules, { recursive: true, force: true });
+      }
     } catch {
-      // ignore
+      // ignore stale workspace-local install state
     }
   }
 
@@ -855,8 +859,8 @@ app.post('/api/terminal/cancel/:sessionId', (req: Request, res: Response) => {
   }
 
   active.session.status = 'cancelled';
-  const cancelEvent = {
-    type: 'system' as const,
+  const cancelEvent: TerminalSessionRecord['events'][number] = {
+    type: 'system',
     text: `[PROCESS CANCELLED] Execution terminated by user.`,
     timestamp: Date.now(),
     status: 'cancelled',
@@ -901,6 +905,575 @@ app.get('/api/terminal/sessions/:projectId', (req: Request, res: Response) => {
 
   const sessions = Array.from(map.values()).sort((a, b) => b.startedAt - a.startedAt);
   res.json({ success: true, count: sessions.length, sessions });
+});
+
+interface RuntimeRecord {
+  projectId: string;
+  process: ChildProcess;
+  port: number;
+  state: 'STARTING' | 'RUNNING' | 'FAILED' | 'STOPPED';
+  startedAt: number;
+  pid?: number;
+  previewUrl: string;
+  error?: string;
+}
+
+const activeRuntimeProcesses = new Map<string, RuntimeRecord>();
+
+function buildRuntimePreviewUrl(projectId: string): string {
+  return `/api/runtime/preview/${encodeURIComponent(projectId)}/`;
+}
+
+function createRuntimeEnvironment(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    PATH: process.env.PATH,
+    HOME: process.env.HOME,
+    TMPDIR: process.env.TMPDIR,
+    NODE_ENV: 'development',
+  };
+  delete env.GITHUB_TOKEN;
+  delete env.GEMINI_API_KEY;
+  return env;
+}
+
+function isLocalPortFree(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const tester = net.createServer();
+    tester.once('error', () => resolve(false));
+    tester.once('listening', () => {
+      tester.close(() => resolve(true));
+    });
+    tester.listen(port, '127.0.0.1');
+  });
+}
+
+async function reserveRuntimePort(port: number): Promise<number> {
+  const cleanupOwnedPort = async (): Promise<boolean> => {
+    try {
+      const pids = execSync(`lsof -nP -t -iTCP:${port} -sTCP:LISTEN`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+        .split(/\s+/)
+        .map((value) => value.trim())
+        .filter(Boolean);
+
+      for (const pid of pids) {
+        try {
+          process.kill(Number(pid), 'SIGTERM');
+        } catch {
+          // ignore stale process that already exited
+        }
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 750));
+      return await isLocalPortFree(port);
+    } catch {
+      return await isLocalPortFree(port);
+    }
+  };
+
+  if (await cleanupOwnedPort()) return port;
+
+  for (let candidate = port + 1; candidate <= port + 20; candidate += 1) {
+    if (await isLocalPortFree(candidate)) return candidate;
+  }
+
+  return port;
+}
+
+async function waitForRuntimeReadiness(projectId: string, port: number, timeoutMs = 45000): Promise<void> {
+  const started = Date.now();
+  let lastStatus: number | string = 'unreachable';
+
+  while (Date.now() - started < timeoutMs) {
+    const record = activeRuntimeProcesses.get(projectId);
+    if (!record || record.state === 'FAILED' || record.state === 'STOPPED') {
+      throw new Error(record?.error || 'Runtime exited before it became ready.');
+    }
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/`, { redirect: 'manual' });
+      lastStatus = response.status;
+      if (response.ok) {
+        return;
+      }
+
+      const body = await response.text();
+      const previewText = body.replace(/\s+/g, ' ').slice(0, 120);
+      throw new Error(`HTTP readiness check failed: ${response.status} ${response.statusText}${previewText ? ` - ${previewText}` : ''}`);
+    } catch (err: any) {
+      if (err instanceof Error && /HTTP readiness check failed:/.test(err.message)) {
+        throw err;
+      }
+      // Keep polling until the app becomes reachable.
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+
+  throw new Error(`HTTP readiness check failed after ${timeoutMs}ms (last status: ${lastStatus}).`);
+}
+
+async function installRuntimeDependencies(workspaceRoot: string): Promise<void> {
+  const { manager } = detectPackageManager(workspaceRoot);
+  const installCommand = manager === 'npm' ? 'npm install' : manager === 'pnpm' ? 'pnpm install' : manager === 'yarn' ? 'yarn install' : 'bun install';
+  const validation = validateCommandSandbox(installCommand);
+  if (!validation.allowed) {
+    throw new Error(validation.reason || 'Install command is blocked by the sandbox.');
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(validation.executable, validation.args, {
+      cwd: workspaceRoot,
+      env: createRuntimeEnvironment(),
+      shell: false,
+    });
+
+    let output = '';
+    child.stdout?.on('data', (chunk: Buffer) => {
+      output += chunk.toString('utf-8');
+    });
+    child.stderr?.on('data', (chunk: Buffer) => {
+      output += chunk.toString('utf-8');
+    });
+
+    child.once('error', (err) => reject(new Error(`Dependency installation failed to start: ${err.message}`)));
+    child.once('close', (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(`Dependency installation exited with code ${code}. ${output.trim().slice(0, 500)}`));
+    });
+  });
+}
+
+function spawnProjectRuntime(projectId: string, workspaceRoot: string, port: number): ChildProcess {
+  const { manager } = detectPackageManager(workspaceRoot);
+  const packageJsonPath = path.join(workspaceRoot, 'package.json');
+  let devCommand = `${manager} run dev`;
+  let args: string[] = [];
+
+  if (fs.existsSync(packageJsonPath)) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+      const rawDevScript = pkg && typeof pkg.scripts === 'object' && typeof pkg.scripts.dev === 'string' ? pkg.scripts.dev : '';
+      if (rawDevScript && /--host|--port|--strictPort/.test(rawDevScript)) {
+        devCommand = `${manager} run dev`;
+      } else {
+        devCommand = `${manager} run dev -- --host 127.0.0.1 --port ${port} --strictPort`;
+        args = ['run', 'dev', '--', '--host', '127.0.0.1', '--port', String(port), '--strictPort'];
+      }
+    } catch {
+      devCommand = `${manager} run dev -- --host 127.0.0.1 --port ${port} --strictPort`;
+      args = ['run', 'dev', '--', '--host', '127.0.0.1', '--port', String(port), '--strictPort'];
+    }
+  } else {
+    devCommand = `${manager} run dev -- --host 127.0.0.1 --port ${port} --strictPort`;
+    args = ['run', 'dev', '--', '--host', '127.0.0.1', '--port', String(port), '--strictPort'];
+  }
+
+  const validation = validateCommandSandbox(devCommand);
+  if (!validation.allowed) {
+    throw new Error(validation.reason || 'Runtime start command is blocked by the sandbox.');
+  }
+
+  const commandArgs = args.length > 0 ? args : validation.args;
+  const child = spawn(validation.executable, commandArgs, {
+    cwd: workspaceRoot,
+    env: createRuntimeEnvironment(),
+    shell: false,
+  });
+
+  child.stdout?.on('data', (chunk: Buffer) => {
+    const output = redactTerminalSecrets(chunk.toString('utf-8'));
+    console.log(`[RUNTIME ${projectId}] ${output.trimEnd()}`);
+  });
+
+  child.stderr?.on('data', (chunk: Buffer) => {
+    const output = redactTerminalSecrets(chunk.toString('utf-8'));
+    console.warn(`[RUNTIME ${projectId}] ${output.trimEnd()}`);
+  });
+
+  return child;
+}
+
+app.post('/api/runtime/prepare', (req: Request, res: Response) => {
+  const { projectId, files } = req.body as { projectId?: string; files?: Array<{ path: string; content: string }> };
+  if (!projectId || typeof projectId !== 'string') {
+    res.status(400).json({ success: false, error: 'projectId is required.' });
+    return;
+  }
+
+  try {
+    const workspaceRoot = prepareWorkspaceDirectory(projectId, files || []);
+    res.json({ success: true, projectId, workspace: workspaceRoot });
+  } catch (err: any) {
+    res.status(400).json({ success: false, error: err.message || 'Could not prepare workspace.' });
+  }
+});
+
+app.post('/api/runtime/install', (req: Request, res: Response) => {
+  const { projectId, files } = req.body as { projectId?: string; files?: Array<{ path: string; content: string }> };
+  if (!projectId || typeof projectId !== 'string') {
+    res.status(400).json({ success: false, error: 'projectId is required.' });
+    return;
+  }
+
+  try {
+    const workspaceRoot = prepareWorkspaceDirectory(projectId, files || []);
+    const { manager } = detectPackageManager(workspaceRoot);
+    const command = manager === 'npm' ? 'npm install' : manager === 'pnpm' ? 'pnpm install' : manager === 'yarn' ? 'yarn install' : 'bun install';
+    const validation = validateCommandSandbox(command);
+    if (!validation.allowed) {
+      res.status(403).json({ success: false, error: validation.reason || 'Install command is blocked by the sandbox.' });
+      return;
+    }
+
+    const sessionId = `runtime-install-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const session: TerminalSessionRecord = {
+      id: sessionId,
+      projectId,
+      command,
+      workingDirectory: workspaceRoot,
+      status: 'running',
+      startedAt: Date.now(),
+      events: [{ type: 'system', text: `Installing dependencies in ${projectId} using ${manager}.`, timestamp: Date.now() }],
+    };
+
+    const child = spawn(validation.executable, validation.args, {
+      cwd: workspaceRoot,
+      env: createRuntimeEnvironment(),
+      shell: false,
+    });
+
+    child.stdout?.on('data', (chunk: Buffer) => {
+      const text = redactTerminalSecrets(chunk.toString('utf-8'));
+      session.events.push({ type: 'stdout', text, timestamp: Date.now() });
+    });
+
+    child.stderr?.on('data', (chunk: Buffer) => {
+      const text = redactTerminalSecrets(chunk.toString('utf-8'));
+      session.events.push({ type: 'stderr', text, timestamp: Date.now() });
+    });
+
+    child.on('close', (code) => {
+      session.status = code === 0 ? 'completed' : 'failed';
+      session.finishedAt = Date.now();
+      session.durationMs = session.finishedAt - session.startedAt;
+      session.exitCode = code;
+      session.events.push({ type: 'exit', text: `[INSTALL EXIT] code=${code}`, timestamp: Date.now(), exitCode: code, status: session.status });
+    });
+
+    child.on('error', (err) => {
+      session.status = 'failed';
+      session.finishedAt = Date.now();
+      session.durationMs = session.finishedAt - session.startedAt;
+      session.exitCode = 1;
+      session.events.push({ type: 'stderr', text: `Failed to start install: ${err.message}`, timestamp: Date.now() });
+    });
+
+    activeTerminalProcesses.set(sessionId, { process: child, session });
+    res.json({ success: true, projectId, command, session, packageManager: { name: manager, command, reason: 'detected from workspace metadata' } });
+  } catch (err: any) {
+    res.status(400).json({ success: false, error: err.message || 'Dependency installation failed.' });
+  }
+});
+
+app.post('/api/runtime/command', (req: Request, res: Response) => {
+  const { projectId, files, script } = req.body as { projectId?: string; files?: Array<{ path: string; content: string }>; script?: string };
+  if (!projectId || typeof projectId !== 'string') {
+    res.status(400).json({ success: false, error: 'projectId is required.' });
+    return;
+  }
+  if (!script || !['lint', 'typecheck', 'test', 'build'].includes(script)) {
+    res.status(400).json({ success: false, error: 'Valid script name is required: lint, typecheck, test, or build.' });
+    return;
+  }
+
+  try {
+    const workspaceRoot = prepareWorkspaceDirectory(projectId, files || []);
+    const { manager } = detectPackageManager(workspaceRoot);
+    const command = `${manager} run ${script}`;
+    const validation = validateCommandSandbox(command);
+    if (!validation.allowed) {
+      res.status(403).json({ success: false, error: validation.reason || 'Command is blocked by the sandbox.' });
+      return;
+    }
+
+    const sessionId = `runtime-command-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const session: TerminalSessionRecord = {
+      id: sessionId,
+      projectId,
+      command,
+      workingDirectory: workspaceRoot,
+      status: 'running',
+      startedAt: Date.now(),
+      events: [{ type: 'system', text: `Executing ${command} in ${projectId}.`, timestamp: Date.now() }],
+    };
+
+    const child = spawn(validation.executable, validation.args, {
+      cwd: workspaceRoot,
+      env: createRuntimeEnvironment(),
+      shell: false,
+    });
+
+    child.stdout?.on('data', (chunk: Buffer) => {
+      const text = redactTerminalSecrets(chunk.toString('utf-8'));
+      session.events.push({ type: 'stdout', text, timestamp: Date.now() });
+    });
+
+    child.stderr?.on('data', (chunk: Buffer) => {
+      const text = redactTerminalSecrets(chunk.toString('utf-8'));
+      session.events.push({ type: 'stderr', text, timestamp: Date.now() });
+    });
+
+    child.on('close', (code) => {
+      session.status = code === 0 ? 'completed' : 'failed';
+      session.finishedAt = Date.now();
+      session.durationMs = session.finishedAt - session.startedAt;
+      session.exitCode = code;
+      session.events.push({ type: 'exit', text: `[COMMAND EXIT] code=${code}`, timestamp: Date.now(), exitCode: code, status: session.status });
+    });
+
+    child.on('error', (err) => {
+      session.status = 'failed';
+      session.finishedAt = Date.now();
+      session.durationMs = session.finishedAt - session.startedAt;
+      session.exitCode = 1;
+      session.events.push({ type: 'stderr', text: `Failed to start command: ${err.message}`, timestamp: Date.now() });
+    });
+
+    activeTerminalProcesses.set(sessionId, { process: child, session });
+    res.json({ success: true, projectId, command, session });
+  } catch (err: any) {
+    res.status(400).json({ success: false, error: err.message || 'Command execution failed.' });
+  }
+});
+
+app.post('/api/runtime/dev/start', async (req: Request, res: Response) => {
+  const { projectId, files, port = 4173 } = req.body as { projectId?: string; files?: Array<{ path: string; content: string }>; port?: number };
+
+  if (!projectId || typeof projectId !== 'string') {
+    res.status(400).json({ success: false, error: 'projectId is required.' });
+    return;
+  }
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+    res.status(400).json({ success: false, error: 'port must be an integer between 1024 and 65535.' });
+    return;
+  }
+
+  async function terminateRuntime(projectIdToClean: string): Promise<void> {
+    const record = activeRuntimeProcesses.get(projectIdToClean);
+    if (!record || !record.process || record.process.killed) {
+      activeRuntimeProcesses.delete(projectIdToClean);
+      return;
+    }
+
+    record.state = 'FAILED';
+    const child = record.process;
+    const hook = new Promise<void>((resolve) => {
+      const done = () => resolve();
+      child.once('exit', done);
+      child.once('close', done);
+    });
+
+    try {
+      child.kill('SIGTERM');
+      await Promise.race([
+        hook,
+        new Promise<void>((resolve) => setTimeout(resolve, 1500)),
+      ]);
+    } catch {
+      // ignore termination failure
+    }
+
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      // ignore
+    }
+
+    activeRuntimeProcesses.delete(projectIdToClean);
+  }
+
+  try {
+    const workspaceRoot = prepareWorkspaceDirectory(projectId, files || []);
+    const existing = activeRuntimeProcesses.get(projectId);
+    if (existing && existing.process && !existing.process.killed) {
+      if (existing.state === 'RUNNING') {
+        res.json({ success: true, runtime: { projectId, state: 'RUNNING', pid: existing.pid ?? existing.process.pid, port: existing.port, startedAt: existing.startedAt, previewUrl: existing.previewUrl }, readiness: 'PASS' });
+        return;
+      }
+    }
+
+    const hasNodeModules = fs.existsSync(path.join(workspaceRoot, 'node_modules'));
+    if (!hasNodeModules) {
+      try {
+        await installRuntimeDependencies(workspaceRoot);
+      } catch (err: any) {
+        res.status(502).json({ success: false, error: err.message || 'Dependency installation failed before runtime start.', runtime: { projectId, state: 'FAILED', port, previewUrl: buildRuntimePreviewUrl(projectId), error: err.message || 'Dependency installation failed before runtime start.' }, readiness: 'FAIL' });
+        return;
+      }
+    }
+
+    const runtimePort = await reserveRuntimePort(port);
+    const record: RuntimeRecord = {
+      projectId,
+      process: spawnProjectRuntime(projectId, workspaceRoot, runtimePort),
+      port: runtimePort,
+      state: 'STARTING',
+      startedAt: Date.now(),
+      pid: undefined,
+      previewUrl: buildRuntimePreviewUrl(projectId),
+    };
+    record.pid = record.process.pid;
+    activeRuntimeProcesses.set(projectId, record);
+
+    record.process.once('close', (code) => {
+      const current = activeRuntimeProcesses.get(projectId);
+      if (!current || current.process !== record.process) return;
+      current.state = 'FAILED';
+      current.error = code === 0 ? 'Runtime stopped before reporting ready.' : `Runtime exited with code ${code ?? 'unknown'}.`;
+    });
+
+    record.process.once('error', (err) => {
+      const current = activeRuntimeProcesses.get(projectId);
+      if (!current || current.process !== record.process) return;
+      current.state = 'FAILED';
+      current.error = err.message || 'Runtime failed to start.';
+    });
+
+    try {
+      await waitForRuntimeReadiness(projectId, runtimePort);
+      const current = activeRuntimeProcesses.get(projectId);
+      if (!current || current.process.killed) {
+        throw new Error('Runtime process stopped before it became ready.');
+      }
+      current.state = 'RUNNING';
+      current.error = undefined;
+      res.json({
+        success: true,
+        runtime: { projectId, state: 'RUNNING', pid: current.pid ?? current.process.pid, port: current.port, startedAt: current.startedAt, previewUrl: current.previewUrl },
+        readiness: 'PASS',
+      });
+      return;
+    } catch (err: any) {
+      const current = activeRuntimeProcesses.get(projectId);
+      if (current && current.process) {
+        current.state = 'FAILED';
+        current.error = err.message || 'Runtime failed to reach a ready state.';
+      }
+      await terminateRuntime(projectId);
+      res.status(502).json({ success: false, error: err.message || 'Runtime failed to start.', runtime: { projectId, state: 'FAILED', port: runtimePort, previewUrl: buildRuntimePreviewUrl(projectId), error: err.message || 'Runtime failed to start.' }, readiness: 'FAIL' });
+      return;
+    }
+  } catch (err: any) {
+    res.status(400).json({ success: false, error: err.message || 'Could not start runtime.' });
+  }
+});
+
+app.post('/api/runtime/dev/stop/:projectId', (req: Request, res: Response) => {
+  const { projectId } = req.params;
+  const record = activeRuntimeProcesses.get(projectId);
+  if (!record) {
+    res.json({ success: true, runtime: null, stopped: true });
+    return;
+  }
+
+  try {
+    record.process.kill('SIGTERM');
+    setTimeout(() => {
+      try {
+        if (!record.process.killed) {
+          record.process.kill('SIGKILL');
+        }
+      } catch {
+        // ignore
+      }
+    }, 1000);
+  } catch {
+    // ignore
+  }
+
+  activeRuntimeProcesses.delete(projectId);
+  res.json({ success: true, runtime: null, stopped: true });
+});
+
+app.get('/api/runtime/dev/status/:projectId', (req: Request, res: Response) => {
+  const { projectId } = req.params;
+  const record = activeRuntimeProcesses.get(projectId);
+  if (!record) {
+    res.json({ success: true, runtime: null });
+    return;
+  }
+
+  res.json({
+    success: true,
+    runtime: {
+      projectId: record.projectId,
+      state: record.state,
+      pid: record.pid ?? record.process.pid,
+      port: record.port,
+      startedAt: record.startedAt,
+      previewUrl: record.previewUrl,
+      error: record.error,
+    },
+  });
+});
+
+function rewriteProjectScopedPreviewHtml(projectId: string, html: string): string {
+  const previewPrefix = `/api/runtime/preview/${encodeURIComponent(projectId)}`;
+  return html.replace(/(src|href)=(['"])(\/[^'"?#]+)(\?[^'"#]*)?(#[^'"#]*)?\2/gi, (match, attr, quote, url, query = '', hash = '') => {
+    if (!url || url.startsWith('/api/runtime/preview/')) {
+      return match;
+    }
+    if (/^(?:https?:|data:|mailto:|tel:|#)/i.test(url)) {
+      return match;
+    }
+    const resolved = `${previewPrefix}${url}${query || ''}${hash || ''}`;
+    return `${attr}=${quote}${resolved}${quote}`;
+  });
+}
+
+app.get(['/api/runtime/preview/:projectId', '/api/runtime/preview/:projectId/*'], async (req: Request, res: Response) => {
+  const { projectId } = req.params;
+  const record = activeRuntimeProcesses.get(projectId);
+  if (!record || record.state !== 'RUNNING') {
+    res.status(409).json({ success: false, error: 'Development server is not running.' });
+    return;
+  }
+
+  const suffix = req.params[0] || '';
+  const query = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '';
+  const target = `http://127.0.0.1:${record.port}/${suffix}${query}`;
+
+  try {
+    const upstream = await fetch(target, {
+      headers: {
+        Accept: req.headers.accept || '*/*',
+      },
+      redirect: 'manual',
+    });
+
+    const body = Buffer.from(await upstream.arrayBuffer());
+    const headers = upstream.headers;
+    res.status(upstream.status);
+    headers.forEach((value, key) => {
+      if (!['connection', 'transfer-encoding', 'content-length'].includes(key.toLowerCase())) {
+        res.setHeader(key, value);
+      }
+    });
+
+    const contentType = (headers.get('content-type') || '').toLowerCase();
+    if (contentType.includes('text/html')) {
+      res.send(rewriteProjectScopedPreviewHtml(projectId, body.toString('utf-8')));
+      return;
+    }
+
+    res.send(body);
+  } catch (err: any) {
+    res.status(502).json({ success: false, error: err.message || 'Development server is not ready.' });
+  }
 });
 
 type PackageManager = 'npm' | 'pnpm' | 'yarn' | 'bun';
