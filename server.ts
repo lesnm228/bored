@@ -1014,9 +1014,16 @@ async function waitForRuntimeReadiness(projectId: string, port: number, timeoutM
   throw new Error(`HTTP readiness check failed after ${timeoutMs}ms (last status: ${lastStatus}).`);
 }
 
+function getRuntimeInstallCommand(manager: PackageManager): string {
+  if (manager === 'npm') return 'npm install --include=dev';
+  if (manager === 'pnpm') return 'pnpm install';
+  if (manager === 'yarn') return 'yarn install';
+  return 'bun install';
+}
+
 async function installRuntimeDependencies(workspaceRoot: string): Promise<void> {
   const { manager } = detectPackageManager(workspaceRoot);
-  const installCommand = manager === 'npm' ? 'npm install' : manager === 'pnpm' ? 'pnpm install' : manager === 'yarn' ? 'yarn install' : 'bun install';
+  const installCommand = getRuntimeInstallCommand(manager);
   const validation = validateCommandSandbox(installCommand);
   if (!validation.allowed) {
     throw new Error(validation.reason || 'Install command is blocked by the sandbox.');
@@ -1123,7 +1130,7 @@ app.post('/api/runtime/install', (req: Request, res: Response) => {
   try {
     const workspaceRoot = prepareWorkspaceDirectory(projectId, files || []);
     const { manager } = detectPackageManager(workspaceRoot);
-    const command = manager === 'npm' ? 'npm install' : manager === 'pnpm' ? 'pnpm install' : manager === 'yarn' ? 'yarn install' : 'bun install';
+    const command = getRuntimeInstallCommand(manager);
     const validation = validateCommandSandbox(command);
     if (!validation.allowed) {
       res.status(403).json({ success: false, error: validation.reason || 'Install command is blocked by the sandbox.' });
