@@ -1037,6 +1037,17 @@ async function installRuntimeDependencies(workspaceRoot: string): Promise<void> 
     });
 
     let output = '';
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        // ignore
+      }
+      reject(new Error(`Dependency installation timed out after 120000ms. ${output.trim().slice(-500)}`));
+    }, 120000);
     child.stdout?.on('data', (chunk: Buffer) => {
       output += chunk.toString('utf-8');
     });
@@ -1044,18 +1055,26 @@ async function installRuntimeDependencies(workspaceRoot: string): Promise<void> 
       output += chunk.toString('utf-8');
     });
 
-    child.once('error', (err) => reject(new Error(`Dependency installation failed to start: ${err.message}`)));
+    child.once('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      reject(new Error(`Dependency installation failed to start: ${err.message}`));
+    });
     child.once('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
       if (code === 0) {
         resolve();
         return;
       }
-      reject(new Error(`Dependency installation exited with code ${code}. ${output.trim().slice(0, 500)}`));
+      reject(new Error(`Dependency installation exited with code ${code ?? 'unknown'}. ${output.trim().slice(-500)}`));
     });
   });
 }
 
-function spawnProjectRuntime(projectId: string, workspaceRoot: string, port: number): ChildProcess {
+function spawnProjectRuntime(projectId: string, workspaceRoot: string, port: number, onOutput?: (output: string) => void): ChildProcess {
   const { manager } = detectPackageManager(workspaceRoot);
   const packageJsonPath = path.join(workspaceRoot, 'package.json');
   let devCommand = `${manager} run dev`;
@@ -1094,11 +1113,13 @@ function spawnProjectRuntime(projectId: string, workspaceRoot: string, port: num
 
   child.stdout?.on('data', (chunk: Buffer) => {
     const output = redactTerminalSecrets(chunk.toString('utf-8'));
+    onOutput?.(output);
     console.log(`[RUNTIME ${projectId}] ${output.trimEnd()}`);
   });
 
   child.stderr?.on('data', (chunk: Buffer) => {
     const output = redactTerminalSecrets(chunk.toString('utf-8'));
+    onOutput?.(output);
     console.warn(`[RUNTIME ${projectId}] ${output.trimEnd()}`);
   });
 
@@ -1270,10 +1291,10 @@ app.post('/api/runtime/dev/start', async (req: Request, res: Response) => {
     return;
   }
 
-  async function terminateRuntime(projectIdToClean: string): Promise<void> {
+  async function terminateRuntime(projectIdToClean: string, removeRecord = true): Promise<void> {
     const record = activeRuntimeProcesses.get(projectIdToClean);
     if (!record || !record.process || record.process.killed) {
-      activeRuntimeProcesses.delete(projectIdToClean);
+      if (removeRecord) activeRuntimeProcesses.delete(projectIdToClean);
       return;
     }
 
@@ -1301,7 +1322,7 @@ app.post('/api/runtime/dev/start', async (req: Request, res: Response) => {
       // ignore
     }
 
-    activeRuntimeProcesses.delete(projectIdToClean);
+    if (removeRecord) activeRuntimeProcesses.delete(projectIdToClean);
   }
 
   try {
@@ -1325,9 +1346,12 @@ app.post('/api/runtime/dev/start', async (req: Request, res: Response) => {
     }
 
     const runtimePort = await reserveRuntimePort(port);
+    let runtimeOutput = '';
     const record: RuntimeRecord = {
       projectId,
-      process: spawnProjectRuntime(projectId, workspaceRoot, runtimePort),
+      process: spawnProjectRuntime(projectId, workspaceRoot, runtimePort, (output) => {
+        runtimeOutput = `${runtimeOutput}${output}`.slice(-4000);
+      }),
       port: runtimePort,
       state: 'STARTING',
       startedAt: Date.now(),
@@ -1341,7 +1365,8 @@ app.post('/api/runtime/dev/start', async (req: Request, res: Response) => {
       const current = activeRuntimeProcesses.get(projectId);
       if (!current || current.process !== record.process) return;
       current.state = 'FAILED';
-      current.error = code === 0 ? 'Runtime stopped before reporting ready.' : `Runtime exited with code ${code ?? 'unknown'}.`;
+      const message = code === 0 ? 'Runtime stopped before reporting ready.' : `Runtime exited with code ${code ?? 'unknown'}.`;
+      current.error = runtimeOutput.trim() ? `${message} Output: ${runtimeOutput.trim().slice(-1500)}` : message;
     });
 
     record.process.once('error', (err) => {
@@ -1369,10 +1394,12 @@ app.post('/api/runtime/dev/start', async (req: Request, res: Response) => {
       const current = activeRuntimeProcesses.get(projectId);
       if (current && current.process) {
         current.state = 'FAILED';
-        current.error = err.message || 'Runtime failed to reach a ready state.';
+        const message = err.message || 'Runtime failed to reach a ready state.';
+        current.error = runtimeOutput.trim() ? `${message} Output: ${runtimeOutput.trim().slice(-1500)}` : message;
       }
-      await terminateRuntime(projectId);
-      res.status(502).json({ success: false, error: err.message || 'Runtime failed to start.', runtime: { projectId, state: 'FAILED', port: runtimePort, previewUrl: buildRuntimePreviewUrl(projectId), error: err.message || 'Runtime failed to start.' }, readiness: 'FAIL' });
+      const error = activeRuntimeProcesses.get(projectId)?.error || err.message || 'Runtime failed to start.';
+      await terminateRuntime(projectId, false);
+      res.status(502).json({ success: false, error, runtime: { projectId, state: 'FAILED', port: runtimePort, previewUrl: buildRuntimePreviewUrl(projectId), error }, readiness: 'FAIL' });
       return;
     }
   } catch (err: any) {
