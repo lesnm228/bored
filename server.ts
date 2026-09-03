@@ -8,6 +8,7 @@ import * as esbuild from 'esbuild';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
+import { resolveWorkspacePath as resolveSecureWorkspacePath } from './src/services/workspacePathSecurity';
 
 dotenv.config();
 
@@ -386,13 +387,8 @@ function getWorkspaceRoot(projectId: string): string {
   return path.join(DATA_DIR, 'workspaces', projectId);
 }
 
-function resolveWorkspacePath(workspaceRoot: string, relativePath: string): string {
-  const normalized = relativePath.replace(/^\/+/, '');
-  const resolved = path.resolve(workspaceRoot, normalized);
-  if (resolved !== workspaceRoot && !resolved.startsWith(`${workspaceRoot}${path.sep}`)) {
-    throw new Error('Path escapes the authorized workspace.');
-  }
-  return resolved;
+export function resolveWorkspacePath(workspaceRoot: string, relativePath: string): string {
+  return resolveSecureWorkspacePath(workspaceRoot, relativePath);
 }
 
 function redactTerminalSecrets(text: string): string {

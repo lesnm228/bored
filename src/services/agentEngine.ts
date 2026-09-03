@@ -3,6 +3,7 @@ import { buildWorkspaceDependencyGraph, validateWorkspacePath } from './dependen
 import { TerminalService } from './terminalService';
 import { GitService } from './gitService';
 import { ProjectService } from './projectService';
+import { taskStatusAfterPipeline, updateAuthoritativeTask } from './taskExecutionPolicy';
 
 export interface AgentExecutionCallbacks {
   onStateChange: (state: AgentRunState) => void;
@@ -12,6 +13,7 @@ export interface AgentExecutionCallbacks {
   onTestUpdate: (test: TestCase) => void;
   onCompleted: (summary: string) => void;
   onError: (error: string) => void;
+  selectedTaskId?: string;
 }
 
 type RealBuildStepResult = {
@@ -794,7 +796,8 @@ button, input { font: inherit; }
     autonomy: AutonomyLevel,
     maxSteps: number,
     onProjectUpdate: (p: ProjectConfig) => void,
-    onLog: (msg: string, level?: any, source?: string) => void
+    onLog: (msg: string, level?: any, source?: string) => void,
+    selectedTaskId?: string
   ): Promise<void> {
     let currentProj = { ...project };
     let resumeFromStep = 0;
@@ -830,9 +833,11 @@ button, input { font: inherit; }
       },
       onTaskUpdate: (updatedTask) => {
         const taskExists = currentProj.tasks.some((t) => t.id === updatedTask.id);
-        const newTasks = taskExists
-          ? currentProj.tasks.map((t) => (t.id === updatedTask.id ? updatedTask : t))
-          : [updatedTask, ...currentProj.tasks];
+        const newTasks = selectedTaskId
+          ? updateAuthoritativeTask(currentProj.tasks, selectedTaskId, updatedTask)
+          : taskExists
+            ? currentProj.tasks.map((t) => (t.id === updatedTask.id ? updatedTask : t))
+            : [updatedTask, ...currentProj.tasks];
         currentProj = { ...currentProj, tasks: newTasks, updatedAt: Date.now() };
         onProjectUpdate(currentProj);
         void this.persistAgentContext(currentProj, this.state);
@@ -850,6 +855,7 @@ button, input { font: inherit; }
       onError: (err) => {
         onLog(`Agent error: ${err}`, 'error', 'AGENT');
       },
+      selectedTaskId,
     }, resumeFromStep);
     await this.persistAgentContext(currentProj, this.state);
   }
@@ -984,6 +990,9 @@ button, input { font: inherit; }
       addThought('Snapshot', `Created rollback checkpoint for ${originalFiles.length} workspace files.`, 'verification');
 
       // Phase 2: Execute each task (Multi-file enabled)
+      const authoritativeTask = callbacks.selectedTaskId
+        ? project.tasks.find((task) => task.id === callbacks.selectedTaskId)
+        : undefined;
       for (let i = resumeFromStep; i < planResult.tasks.length; i++) {
         if (signal.aborted) throw new Error('Aborted by user');
 
@@ -1007,25 +1016,39 @@ button, input { font: inherit; }
         }
 
         // Initialize Task Item with planned files and rollback capability
-        const newTaskItem: TaskItem = {
-          id: `agent-task-${Date.now()}-${i}`,
-          title: taskDef.title,
-          description: taskDef.description,
-          status: 'working',
-          priority: taskDef.priority || 'high',
-          assignedTo: 'builder-agent',
-          targetFiles: targetFilesList,
-          plannedFiles: targetFilesList,
-          modifiedFiles: [],
-          canRollback: true,
-          isRolledBack: false,
-          createdAt: Date.now(),
-          subtasks: taskDef.subtasks?.map((st, sidx) => ({
-            id: `sub-${Date.now()}-${sidx}`,
-            title: st,
-            completed: false,
-          })) || [],
-        };
+        const newTaskItem: TaskItem = authoritativeTask
+          ? {
+              ...authoritativeTask,
+              status: 'working',
+              assignedTo: 'builder-agent',
+              targetFiles: targetFilesList,
+              plannedFiles: targetFilesList,
+              modifiedFiles: [],
+              subtasks: taskDef.subtasks?.map((st, sidx) => ({
+                id: `${authoritativeTask.id}-sub-${sidx}`,
+                title: st,
+                completed: false,
+              })) || authoritativeTask.subtasks,
+            }
+          : {
+              id: `agent-task-${Date.now()}-${i}`,
+              title: taskDef.title,
+              description: taskDef.description,
+              status: 'working',
+              priority: taskDef.priority || 'high',
+              assignedTo: 'builder-agent',
+              targetFiles: targetFilesList,
+              plannedFiles: targetFilesList,
+              modifiedFiles: [],
+              canRollback: true,
+              isRolledBack: false,
+              createdAt: Date.now(),
+              subtasks: taskDef.subtasks?.map((st, sidx) => ({
+                id: `sub-${Date.now()}-${sidx}`,
+                title: st,
+                completed: false,
+              })) || [],
+            };
         callbacks.onTaskUpdate(newTaskItem);
 
         addThought('Executing', `Starting Task ${i + 1}/${planResult.tasks.length}: "${taskDef.title}" across ${targetFilesList.length} files: [${targetFilesList.join(', ')}]`, 'action');
@@ -1264,12 +1287,9 @@ button, input { font: inherit; }
           throw new Error(`Validation failed: ${validationErrorMsg}`);
         }
 
-        // Mark task completed only after validation passes
-        newTaskItem.status = 'completed';
-        newTaskItem.completedAt = Date.now();
-        newTaskItem.subtasks = newTaskItem.subtasks?.map((st) => ({ ...st, completed: true }));
+        // Keep the task validating until the complete pipeline below succeeds.
+        newTaskItem.status = 'validating';
         callbacks.onTaskUpdate(newTaskItem);
-        addThought('Task Verified', `Task ${i + 1}/${planResult.tasks.length} passed cross-module validation and committed to workspace.`, 'verification');
       }
 
       // Phase 3: Real In-Memory Testing and Validation Matrix
@@ -1400,6 +1420,18 @@ button, input { font: inherit; }
       }
       addThought('Verified', `PUSH VERIFIED: remote SHA ${pushResult.verifiedRemoteSha}.`, 'verification');
 
+      if (callbacks.selectedTaskId) {
+        const completedTask = project.tasks.find((task) => task.id === callbacks.selectedTaskId);
+        if (completedTask) {
+          callbacks.onTaskUpdate({
+            ...completedTask,
+            status: taskStatusAfterPipeline({ esbuildPassed: true, requiredPipelinePassed: true, aborted: false }),
+            completedAt: Date.now(),
+            subtasks: completedTask.subtasks?.map((subtask) => ({ ...subtask, completed: true })),
+          });
+        }
+      }
+
       runState.status = 'completed';
       runState.completedAt = Date.now();
       callbacks.onStateChange({ ...runState });
@@ -1409,6 +1441,10 @@ button, input { font: inherit; }
       const errorMsg = err instanceof Error ? err.message : 'Unknown execution error';
       if (errorMsg === 'Aborted by user') {
         runState.status = 'aborted';
+        if (callbacks.selectedTaskId) {
+          const abortedTask = project.tasks.find((task) => task.id === callbacks.selectedTaskId);
+          if (abortedTask) callbacks.onTaskUpdate({ ...abortedTask, status: taskStatusAfterPipeline({ esbuildPassed: false, requiredPipelinePassed: false, aborted: true }), completedAt: Date.now() });
+        }
         addThought('Aborted', 'Agent execution stopped immediately by user command.', 'action');
         callbacks.onLog({
           id: `log-${Date.now()}`,
@@ -1425,6 +1461,10 @@ button, input { font: inherit; }
           addThought('Rollback', 'Restored the rollback checkpoint after an unsafe failed run.', 'verification');
         }
         runState.status = isBlocked ? 'blocked' : 'error';
+        if (callbacks.selectedTaskId) {
+          const failedTask = project.tasks.find((task) => task.id === callbacks.selectedTaskId);
+          if (failedTask) callbacks.onTaskUpdate({ ...failedTask, status: taskStatusAfterPipeline({ esbuildPassed: false, requiredPipelinePassed: false, aborted: false }), validationError: errorMsg, completedAt: Date.now() });
+        }
         runState.error = errorMsg;
         addThought('Error', `Execution halted: ${errorMsg}`, 'action');
         callbacks.onError(errorMsg);

@@ -224,7 +224,8 @@ export default function App() {
     goal: string,
     autonomy: AutonomyLevel = settings.autonomyLevel,
     maxSteps: number = settings.maxStepBudget,
-    projectOverride?: ProjectConfig
+    projectOverride?: ProjectConfig,
+    selectedTaskId?: string
   ) => {
     appendLog(`Builder Agent triggered with goal: "${goal}"`, 'info', 'AGENT');
     setLogsOpen(true);
@@ -240,7 +241,8 @@ export default function App() {
         },
         (msg, level, src) => {
           appendLog(msg, level, src);
-        }
+        },
+        selectedTaskId
       );
     } catch (err: any) {
       appendLog(`Agent run failed: ${err?.message || 'Unknown error'}`, 'error', 'AGENT');
@@ -807,7 +809,7 @@ export default function App() {
                   ),
                 };
                 handleUpdateProject(taskProject);
-                void handleExecuteAgent(task.title, settings.autonomyLevel, settings.maxStepBudget, taskProject);
+                void handleExecuteAgent(task.title, settings.autonomyLevel, settings.maxStepBudget, taskProject, task.id);
               }}
             />
           )}
