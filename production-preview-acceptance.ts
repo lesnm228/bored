@@ -26,7 +26,7 @@ const install = await json<{ command: string; session: { id: string } }>(`${base
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({ projectId, files }),
 });
-assert.equal(install.command, 'npm install --include=dev');
+assert.equal(install.command, 'npm install --include=dev --no-audit --no-fund');
 for (let attempt = 0; attempt < 120; attempt += 1) {
   const sessions = await json<{ sessions: Array<{ id: string; status: string; exitCode?: number | null }> }>(`${baseUrl}/api/terminal/sessions/${projectId}`);
   const session = sessions.sessions.find((candidate) => candidate.id === install.session.id);

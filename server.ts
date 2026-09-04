@@ -1262,8 +1262,9 @@ function spawnProjectRuntime(projectId: string, workspaceRoot: string, port: num
     try {
       const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
       const rawDevScript = pkg && typeof pkg.scripts === 'object' && typeof pkg.scripts.dev === 'string' ? pkg.scripts.dev : '';
-      if (rawDevScript && /--port|--strictPort/.test(rawDevScript)) {
-        devCommand = `${manager} run dev`;
+      if (rawDevScript && /\bvite(?:\s|$)/.test(rawDevScript)) {
+        devCommand = `${manager} run dev -- --host 0.0.0.0 --port ${port} --strictPort`;
+        args = ['run', 'dev', '--', '--host', '0.0.0.0', '--port', String(port), '--strictPort'];
       } else {
         devCommand = `${manager} run dev -- --host 0.0.0.0 --port ${port} --strictPort`;
         args = ['run', 'dev', '--', '--host', '0.0.0.0', '--port', String(port), '--strictPort'];
@@ -1642,18 +1643,26 @@ app.get('/api/runtime/dev/status/:projectId', (req: Request, res: Response) => {
   });
 });
 
-function rewriteProjectScopedPreviewHtml(projectId: string, html: string): string {
+function rewriteProjectScopedPreviewUrls(projectId: string, content: string): string {
   const previewPrefix = `/api/runtime/preview/${encodeURIComponent(projectId)}`;
-  return html.replace(/(src|href)=(['"])(\/[^'"?#]+)(\?[^'"#]*)?(#[^'"#]*)?\2/gi, (match, attr, quote, url, query = '', hash = '') => {
-    if (!url || url.startsWith('/api/runtime/preview/')) {
-      return match;
-    }
-    if (/^(?:https?:|data:|mailto:|tel:|#)/i.test(url)) {
-      return match;
-    }
-    const resolved = `${previewPrefix}${url}${query || ''}${hash || ''}`;
-    return `${attr}=${quote}${resolved}${quote}`;
-  });
+  const rewrite = (url: string, query = '', hash = '') => {
+    if (!url || url.startsWith('/api/runtime/preview/') || /^(?:https?:|data:|mailto:|tel:|#)/i.test(url)) return null;
+    return `${previewPrefix}${url}${query}${hash}`;
+  };
+
+  return content
+    .replace(/((?:src|href)\s*=\s*)(["'])(\/[^"'\s?#]*)(\?[^"'\s#]*)?(#[^"'\s]*)?\2/gi, (match, prefix, quote, url, query = '', hash = '') => {
+      const resolved = rewrite(url, query, hash);
+      return resolved ? `${prefix}${quote}${resolved}${quote}` : match;
+    })
+    .replace(/(\b(?:from\s*|import\s*(?:\(\s*)?|createHotContext\s*\(\s*))(["'`])(\/[^"'`\s?#]*)(\?[^"'`\s#]*)?(#[^"'`\s]*)?\2/g, (match, prefix, quote, url, query = '', hash = '') => {
+      const resolved = rewrite(url, query, hash);
+      return resolved ? `${prefix}${quote}${resolved}${quote}` : match;
+    })
+    .replace(/url\(\s*(\/[^\s)'"?#]+)(\?[^\s)'"#]*)?(#[^\s)'" ]*)?\s*\)/gi, (match, url, query = '', hash = '') => {
+      const resolved = rewrite(url, query, hash);
+      return resolved ? `url(${resolved})` : match;
+    });
 }
 
 app.get(['/api/runtime/preview/:projectId', '/api/runtime/preview/:projectId/*'], async (req: Request, res: Response) => {
@@ -1686,8 +1695,8 @@ app.get(['/api/runtime/preview/:projectId', '/api/runtime/preview/:projectId/*']
     });
 
     const contentType = (headers.get('content-type') || '').toLowerCase();
-    if (contentType.includes('text/html')) {
-      res.send(rewriteProjectScopedPreviewHtml(projectId, body.toString('utf-8')));
+    if (contentType.includes('text/html') || contentType.includes('javascript') || contentType.includes('css')) {
+      res.send(rewriteProjectScopedPreviewUrls(projectId, body.toString('utf-8')));
       return;
     }
 
