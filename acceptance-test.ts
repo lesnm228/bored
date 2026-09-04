@@ -88,7 +88,7 @@ async function verifyManualPreviewFlow(): Promise<void> {
   assert.equal(installResult.status, 'completed', 'dependency install should finish successfully');
   assert.equal(installResult.exitCode, 0, 'dependency install should exit 0');
 
-  const start = await request<{ success: boolean; runtime?: { state: string; port?: number } }>(`${SERVER_URL}/api/runtime/dev/start`, {
+  const start = await request<{ success: boolean; runtime?: { state: string; port?: number; previewUrl?: string } }>(`${SERVER_URL}/api/runtime/dev/start`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ projectId: flowProjectId, files: flowFiles }),
@@ -109,7 +109,7 @@ async function verifyNodeRuntimePortIsolation(): Promise<void> {
     { path: 'server.js', content: "import http from 'node:http';\nconst port = Number(process.env.PORT || 3000);\nconst server = http.createServer((req, res) => { res.statusCode = 200; res.end(`PORT=${port}`); });\nserver.listen(port, '127.0.0.1', () => console.log(`ready:${port}`));\n" },
   ];
 
-  const start = await request<{ success: boolean; runtime?: { state: string; port?: number } }>(`${SERVER_URL}/api/runtime/dev/start`, {
+  const start = await request<{ success: boolean; runtime?: { state: string; port?: number; previewUrl?: string } }>(`${SERVER_URL}/api/runtime/dev/start`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ projectId, files, port: 4173 }),
@@ -186,7 +186,7 @@ export async function verifyBuilderBoard(): Promise<string> {
   await verifyNoHostNodeModulesSymlink();
   await verifyPreviewRestartLifecycle();
 
-  const start = await request<{ success: boolean; runtime?: { state: string; port?: number } }>(`${SERVER_URL}/api/runtime/dev/start`, {
+  const start = await request<{ success: boolean; runtime?: { state: string; port?: number; previewUrl?: string } }>(`${SERVER_URL}/api/runtime/dev/start`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ projectId, files }),
@@ -194,25 +194,33 @@ export async function verifyBuilderBoard(): Promise<string> {
 
   assert.equal(start.success, true, 'runtime should start successfully');
   assert.equal(start.runtime?.state, 'RUNNING', 'runtime should be RUNNING');
+  assert.ok(start.runtime?.port, 'runtime should expose a direct port');
+
+  const directPreviewUrl = `http://127.0.0.1:${start.runtime!.port}/`;
+  assert.equal(start.runtime?.previewUrl, directPreviewUrl, 'runtime previewUrl should point directly at the assigned runtime port');
+
+  const legacyPreviewRedirect = await fetch(`${SERVER_URL}/api/runtime/preview/${projectId}/`);
+  assert.equal(legacyPreviewRedirect.redirected, true, 'legacy preview route should redirect to the direct runtime URL');
+  assert.equal(legacyPreviewRedirect.url, directPreviewUrl, 'legacy preview route should expose the direct runtime origin');
 
   const status = await request<{ runtime: { state: string } | null }>(`${SERVER_URL}/api/runtime/dev/status/${projectId}`);
   assert.equal(status.runtime?.state, 'RUNNING', 'status endpoint should match running runtime');
 
-  const previewHtml = await fetch(`${SERVER_URL}/api/runtime/preview/${projectId}/`);
-  assert.equal(previewHtml.status, 200, 'preview route should be reachable');
+  const previewHtml = await fetch(directPreviewUrl);
+  assert.equal(previewHtml.status, 200, 'direct runtime preview should be reachable');
   const htmlText = await previewHtml.text();
-  assert.match(htmlText, /BUILDER BOARD PREVIEW IS WORKING|src="\/api\/runtime\/preview\//i, 'preview HTML should be served by the project-scoped preview proxy');
+  assert.match(htmlText, /BUILDER BOARD PREVIEW IS WORKING|<script type="module" src="\/src\/main.tsx">/i, 'preview HTML should be served directly by the runtime');
 
-  const previewRoot = await fetch(`${SERVER_URL}/api/runtime/preview/${projectId}`);
-  assert.equal(previewRoot.status, 200, 'preview project root without trailing slash should resolve to the same project-scoped app');
+  const previewRoot = await fetch(directPreviewUrl);
+  assert.equal(previewRoot.status, 200, 'preview project root should resolve on the direct runtime URL');
   const previewRootText = await previewRoot.text();
-  assert.match(previewRootText, /BUILDER BOARD PREVIEW IS WORKING|src="\/api\/runtime\/preview\//i, 'preview root should render the generated app without falling back to bare \/');
+  assert.match(previewRootText, /BUILDER BOARD PREVIEW IS WORKING|<script type="module" src="\/src\/main.tsx">/i, 'preview root should render the generated app from the runtime origin');
 
-  const clientResponse = await fetch(`${SERVER_URL}/api/runtime/preview/${projectId}/@vite/client`);
+  const clientResponse = await fetch(new URL('/@vite/client', directPreviewUrl));
   assert.equal(clientResponse.status, 200, '@vite client should load');
   assert.match(clientResponse.headers.get('content-type') || '', /javascript|text\/plain/i, 'Vite client should be served as JavaScript');
 
-  const mainResponse = await fetch(`${SERVER_URL}/api/runtime/preview/${projectId}/src/main.tsx`);
+  const mainResponse = await fetch(new URL('/src/main.tsx', directPreviewUrl));
   assert.equal(mainResponse.status, 200, 'main module should load');
   assert.match(mainResponse.headers.get('content-type') || '', /javascript|text\/plain/i, 'module should use JavaScript MIME type');
   const mainText = await mainResponse.text();

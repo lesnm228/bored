@@ -1007,6 +1007,10 @@ interface RuntimeRecord {
 const activeRuntimeProcesses = new Map<string, RuntimeRecord>();
 
 function buildRuntimePreviewUrl(projectId: string): string {
+  const record = activeRuntimeProcesses.get(projectId);
+  if (record && record.state === 'RUNNING') {
+    return `http://127.0.0.1:${record.port}/`;
+  }
   return `/api/runtime/preview/${encodeURIComponent(projectId)}/`;
 }
 
@@ -1540,7 +1544,7 @@ app.post('/api/runtime/dev/start', async (req: Request, res: Response) => {
       state: 'STARTING',
       startedAt: Date.now(),
       pid: undefined,
-      previewUrl: buildRuntimePreviewUrl(projectId),
+      previewUrl: `http://127.0.0.1:${runtimePort}/`,
     };
     record.pid = record.process.pid;
     activeRuntimeProcesses.set(projectId, record);
@@ -1643,28 +1647,6 @@ app.get('/api/runtime/dev/status/:projectId', (req: Request, res: Response) => {
   });
 });
 
-function rewriteProjectScopedPreviewUrls(projectId: string, content: string): string {
-  const previewPrefix = `/api/runtime/preview/${encodeURIComponent(projectId)}`;
-  const rewrite = (url: string, query = '', hash = '') => {
-    if (!url || url.startsWith('/api/runtime/preview/') || /^(?:https?:|data:|mailto:|tel:|#)/i.test(url)) return null;
-    return `${previewPrefix}${url}${query}${hash}`;
-  };
-
-  return content
-    .replace(/((?:src|href)\s*=\s*)(["'])(\/[^"'\s?#]*)(\?[^"'\s#]*)?(#[^"'\s]*)?\2/gi, (match, prefix, quote, url, query = '', hash = '') => {
-      const resolved = rewrite(url, query, hash);
-      return resolved ? `${prefix}${quote}${resolved}${quote}` : match;
-    })
-    .replace(/(\b(?:from\s*|import\s*(?:\(\s*)?|createHotContext\s*\(\s*))(["'`])(\/[^"'`\s?#]*)(\?[^"'`\s#]*)?(#[^"'`\s]*)?\2/g, (match, prefix, quote, url, query = '', hash = '') => {
-      const resolved = rewrite(url, query, hash);
-      return resolved ? `${prefix}${quote}${resolved}${quote}` : match;
-    })
-    .replace(/url\(\s*(\/[^\s)'"?#]+)(\?[^\s)'"#]*)?(#[^\s)'" ]*)?\s*\)/gi, (match, url, query = '', hash = '') => {
-      const resolved = rewrite(url, query, hash);
-      return resolved ? `url(${resolved})` : match;
-    });
-}
-
 app.get(['/api/runtime/preview/:projectId', '/api/runtime/preview/:projectId/*'], async (req: Request, res: Response) => {
   const { projectId } = req.params;
   const record = activeRuntimeProcesses.get(projectId);
@@ -1675,35 +1657,8 @@ app.get(['/api/runtime/preview/:projectId', '/api/runtime/preview/:projectId/*']
 
   const suffix = req.params[0] || '';
   const query = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '';
-  const target = `http://127.0.0.1:${record.port}/${suffix}${query}`;
-
-  try {
-    const upstream = await fetch(target, {
-      headers: {
-        Accept: req.headers.accept || '*/*',
-      },
-      redirect: 'manual',
-    });
-
-    const body = Buffer.from(await upstream.arrayBuffer());
-    const headers = upstream.headers;
-    res.status(upstream.status);
-    headers.forEach((value, key) => {
-      if (!['connection', 'transfer-encoding', 'content-length'].includes(key.toLowerCase())) {
-        res.setHeader(key, value);
-      }
-    });
-
-    const contentType = (headers.get('content-type') || '').toLowerCase();
-    if (contentType.includes('text/html') || contentType.includes('javascript') || contentType.includes('css')) {
-      res.send(rewriteProjectScopedPreviewUrls(projectId, body.toString('utf-8')));
-      return;
-    }
-
-    res.send(body);
-  } catch (err: any) {
-    res.status(502).json({ success: false, error: err.message || 'Development server is not ready.' });
-  }
+  const target = new URL(`${suffix ? `/${suffix}` : '/'}${query}`, `http://127.0.0.1:${record.port}/`);
+  res.redirect(302, target.toString());
 });
 
 type PackageManager = 'npm' | 'pnpm' | 'yarn' | 'bun';
