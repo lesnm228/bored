@@ -15,15 +15,41 @@ export const PreviewView: React.FC<PreviewViewProps> = ({ currentProject, runtim
   const previewUrl = `/preview-runtime/${encodeURIComponent(currentProject.id)}/`;
   const [reloadKey, setReloadKey] = useState(0);
   const [previewError, setPreviewError] = useState(false);
+  const [iframeDiagnostic, setIframeDiagnostic] = useState('No iframe event received.');
 
   useEffect(() => {
     setPreviewError(false);
+    setIframeDiagnostic(`runtime=${runtime?.state || 'STOPPED'} src=${previewUrl}?reload=${reloadKey}`);
     if (runtime?.state === 'RUNNING') setReloadKey((k) => k + 1);
   }, [previewUrl, runtime?.state]);
 
   const handleRetry = () => {
     setPreviewError(false);
     setReloadKey((k) => k + 1);
+  };
+
+  const handleIframeLoad = (event: React.SyntheticEvent<HTMLIFrameElement>) => {
+    const iframe = event.currentTarget;
+    try {
+      const document = iframe.contentDocument;
+      const root = document?.getElementById('root');
+      setIframeDiagnostic([
+        `load src=${iframe.src}`,
+        `runtime=${runtime?.state || 'STOPPED'}`,
+        `readyState=${document?.readyState || 'unavailable'}`,
+        `bodyHtml=${document?.body?.innerHTML.length || 0}`,
+        `root=${root ? 'present' : 'missing'}`,
+        `rootChildren=${root?.childElementCount ?? 0}`,
+      ].join(' | '));
+    } catch (error) {
+      setIframeDiagnostic(`load src=${iframe.src} | runtime=${runtime?.state || 'STOPPED'} | document=unavailable (${error instanceof Error ? error.message : 'access denied'})`);
+    }
+    setPreviewError(false);
+  };
+
+  const handleIframeError = (event: React.SyntheticEvent<HTMLIFrameElement>) => {
+    setIframeDiagnostic(`error src=${event.currentTarget.src} | runtime=${runtime?.state || 'STOPPED'}`);
+    setPreviewError(true);
   };
 
   return (
@@ -97,8 +123,8 @@ export const PreviewView: React.FC<PreviewViewProps> = ({ currentProject, runtim
               title="Live project preview"
               className="w-full h-full border-0"
               sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
-              onLoad={() => setPreviewError(false)}
-              onError={() => setPreviewError(true)}
+              onLoad={handleIframeLoad}
+              onError={handleIframeError}
             />
           </div>
         ) : (
@@ -136,6 +162,9 @@ export const PreviewView: React.FC<PreviewViewProps> = ({ currentProject, runtim
             )}
           </div>
         )}
+      </div>
+      <div className="px-6 py-2 border-t border-blue-900/30 bg-[#020617] text-[10px] font-mono text-slate-500 truncate" data-preview-diagnostic>
+        {iframeDiagnostic}
       </div>
     </div>
   );

@@ -1071,7 +1071,7 @@ async function reserveRuntimePort(port: number): Promise<number> {
   return port;
 }
 
-async function waitForRuntimeReadiness(projectId: string, port: number, timeoutMs = 45000): Promise<void> {
+async function waitForRuntimeReadiness(projectId: string, port: number, timeoutMs = 45000, readinessPath = '/'): Promise<void> {
   const started = Date.now();
   let lastStatus: number | string = 'unreachable';
 
@@ -1082,7 +1082,7 @@ async function waitForRuntimeReadiness(projectId: string, port: number, timeoutM
     }
 
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/`, { redirect: 'manual' });
+      const response = await fetch(`http://127.0.0.1:${port}${readinessPath}`, { redirect: 'manual' });
       lastStatus = response.status;
       if (response.ok) {
         return;
@@ -1264,8 +1264,9 @@ function spawnProjectRuntime(projectId: string, workspaceRoot: string, port: num
       const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
       const rawDevScript = pkg && typeof pkg.scripts === 'object' && typeof pkg.scripts.dev === 'string' ? pkg.scripts.dev : '';
       if (rawDevScript && /\bvite(?:\s|$)/.test(rawDevScript)) {
-        devCommand = `${manager} run dev -- --host 0.0.0.0 --port ${port} --strictPort`;
-        args = ['run', 'dev', '--', '--host', '0.0.0.0', '--port', String(port), '--strictPort'];
+        const previewBase = `/preview-runtime/${encodeURIComponent(projectId)}/`;
+        devCommand = `${manager} run dev -- --host 0.0.0.0 --port ${port} --strictPort --base ${previewBase}`;
+        args = ['run', 'dev', '--', '--host', '0.0.0.0', '--port', String(port), '--strictPort', '--base', previewBase];
       } else {
         devCommand = `${manager} run dev -- --host 0.0.0.0 --port ${port} --strictPort`;
         args = ['run', 'dev', '--', '--host', '0.0.0.0', '--port', String(port), '--strictPort'];
@@ -1562,7 +1563,8 @@ app.post('/api/runtime/dev/start', async (req: Request, res: Response) => {
     });
 
     try {
-      await waitForRuntimeReadiness(projectId, runtimePort);
+      const runtimeBase = `/preview-runtime/${encodeURIComponent(projectId)}/`;
+      await waitForRuntimeReadiness(projectId, runtimePort, 45000, runtimeBase);
       const current = activeRuntimeProcesses.get(projectId);
       if (!current || current.process.killed) {
         throw new Error('Runtime process stopped before it became ready.');
@@ -1654,7 +1656,8 @@ app.all(['/preview-runtime/:projectId', '/preview-runtime/:projectId/*'], (req: 
 
   const suffix = req.params[0] || '';
   const query = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '';
-  const targetPath = `${suffix ? `/${suffix}` : '/'}${query}`;
+  const runtimeBase = `/preview-runtime/${encodeURIComponent(projectId)}/`;
+  const targetPath = `${runtimeBase}${suffix}${query}`;
   const headers = { ...req.headers, host: `127.0.0.1:${record.port}` };
   delete headers.connection;
   delete headers['content-length'];

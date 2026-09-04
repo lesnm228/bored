@@ -209,13 +209,12 @@ export async function verifyBuilderBoard(): Promise<string> {
   const previewHtml = await fetch(publicPreviewUrl);
   assert.equal(previewHtml.status, 200, 'public preview forwarding route should be reachable');
   const htmlText = await previewHtml.text();
-  assert.match(htmlText, /BUILDER BOARD PREVIEW IS WORKING|<script type="module" src="\/src\/main\.tsx">/i, 'preview HTML should be served by the runtime without source rewriting');
-  assert.doesNotMatch(htmlText, /preview-runtime\//i, 'preview HTML should not be rewritten by Builder Board');
+  assert.match(htmlText, new RegExp(`<script type="module" src="/preview-runtime/${projectId}/src/main\\.tsx">`, 'i'), 'preview HTML should emit the public Vite base path');
 
   const previewRoot = await fetch(publicPreviewUrl);
   assert.equal(previewRoot.status, 200, 'preview project root should resolve on the public forwarding route');
   const previewRootText = await previewRoot.text();
-  assert.match(previewRootText, /BUILDER BOARD PREVIEW IS WORKING|<script type="module" src="\/src\/main\.tsx">/i, 'preview root should render the generated app from the runtime');
+  assert.match(previewRootText, new RegExp(`<script type="module" src="/preview-runtime/${projectId}/src/main\\.tsx">`, 'i'), 'preview root should render the generated app from the runtime');
 
   const clientResponse = await fetch(`${publicPreviewUrl}@vite/client`);
   assert.equal(clientResponse.status, 200, '@vite client should load');
@@ -229,7 +228,7 @@ export async function verifyBuilderBoard(): Promise<string> {
   assert.match(mainResponse.headers.get('content-type') || '', /javascript|text\/plain/i, 'module should use JavaScript MIME type');
   const mainText = await mainResponse.text();
   assert.match(mainText, /BUILDER BOARD PREVIEW IS WORKING|ReactDOM\.createRoot/i, 'module content should include the generated app source');
-  assert.doesNotMatch(mainText, /preview-runtime\//i, 'JavaScript module source should not be rewritten');
+  assert.doesNotMatch(mainText, /\/api\/runtime\/preview\//i, 'JavaScript module source should not use the legacy Builder rewrite route');
 
   const reactModule = await fetch(`${publicPreviewUrl}node_modules/.vite/deps/react.js`);
   assert.equal(reactModule.status, 200, 'React dependency module should load');
