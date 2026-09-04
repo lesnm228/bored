@@ -268,7 +268,7 @@ npm run dev
           version: '1.0.0',
           private: true,
           type: 'module',
-          scripts: { dev: 'vite', build: 'tsc --noEmit && vite build', lint: 'tsc --noEmit', typecheck: 'tsc --noEmit', test: 'vitest run' },
+          scripts: { dev: 'vite --host 0.0.0.0', build: 'tsc --noEmit && vite build', lint: 'tsc --noEmit', typecheck: 'tsc --noEmit', test: 'vitest run' },
           dependencies: { react: '^19.0.1', 'react-dom': '^19.0.1' },
           devDependencies: { '@types/react': '^19.0.0', '@types/react-dom': '^19.0.0', '@vitejs/plugin-react': '^5.0.4', typescript: '^5.8.2', vite: '^6.2.3', vitest: '^2.0.0' },
         }, null, 2);
