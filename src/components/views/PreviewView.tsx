@@ -12,7 +12,7 @@ interface PreviewViewProps {
 export const PreviewView: React.FC<PreviewViewProps> = ({ currentProject, runtime, onStartRuntime, onStopRuntime }) => {
   const isRunning = runtime?.state === 'RUNNING';
   const isStarting = runtime?.state === 'STARTING';
-  const previewUrl = `/api/runtime/preview/${encodeURIComponent(currentProject.id)}/`;
+  const previewUrl = `/preview-runtime/${encodeURIComponent(currentProject.id)}/`;
   const [reloadKey, setReloadKey] = useState(0);
   const [previewError, setPreviewError] = useState(false);
 

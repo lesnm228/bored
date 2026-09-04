@@ -160,7 +160,7 @@ export const DeploymentsView: React.FC<DeploymentsViewProps> = ({
               <div className="pt-2 border-t border-blue-900/40">
                 {env.configured ? (
                   <a
-                    href={env.id === 'local' && runtime?.state === 'RUNNING' ? `/api/runtime/preview/${currentProject.id}/` : env.url}
+                    href={env.id === 'local' && runtime?.state === 'RUNNING' ? `/preview-runtime/${encodeURIComponent(currentProject.id)}/` : env.url}
                     target="_blank"
                     rel="noreferrer"
                     className="text-[11px] text-blue-400 hover:text-amber-300 flex items-center gap-1 truncate font-mono"

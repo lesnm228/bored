@@ -194,37 +194,46 @@ export async function verifyBuilderBoard(): Promise<string> {
 
   assert.equal(start.success, true, 'runtime should start successfully');
   assert.equal(start.runtime?.state, 'RUNNING', 'runtime should be RUNNING');
-  assert.ok(start.runtime?.port, 'runtime should expose a direct port');
+  assert.ok(start.runtime?.previewUrl, 'runtime should expose a public preview URL');
+  assert.match(start.runtime.previewUrl, /^\/preview-runtime\//, 'runtime preview URL should use the public forwarding route');
+  assert.doesNotMatch(start.runtime.previewUrl, /127\.0\.0\.1|localhost|:\d+\//, 'runtime preview URL must not expose an internal address or port');
 
-  const directPreviewUrl = `http://127.0.0.1:${start.runtime!.port}/`;
-  assert.equal(start.runtime?.previewUrl, directPreviewUrl, 'runtime previewUrl should point directly at the assigned runtime port');
-
+  const publicPreviewUrl = `${SERVER_URL}${start.runtime.previewUrl}`;
   const legacyPreviewRedirect = await fetch(`${SERVER_URL}/api/runtime/preview/${projectId}/`);
-  assert.equal(legacyPreviewRedirect.redirected, true, 'legacy preview route should redirect to the direct runtime URL');
-  assert.equal(legacyPreviewRedirect.url, directPreviewUrl, 'legacy preview route should expose the direct runtime origin');
+  assert.equal(legacyPreviewRedirect.redirected, true, 'legacy preview route should redirect to the public forwarding route');
+  assert.equal(legacyPreviewRedirect.url, publicPreviewUrl, 'legacy preview route should preserve the public preview origin');
 
   const status = await request<{ runtime: { state: string } | null }>(`${SERVER_URL}/api/runtime/dev/status/${projectId}`);
   assert.equal(status.runtime?.state, 'RUNNING', 'status endpoint should match running runtime');
 
-  const previewHtml = await fetch(directPreviewUrl);
-  assert.equal(previewHtml.status, 200, 'direct runtime preview should be reachable');
+  const previewHtml = await fetch(publicPreviewUrl);
+  assert.equal(previewHtml.status, 200, 'public preview forwarding route should be reachable');
   const htmlText = await previewHtml.text();
-  assert.match(htmlText, /BUILDER BOARD PREVIEW IS WORKING|<script type="module" src="\/src\/main.tsx">/i, 'preview HTML should be served directly by the runtime');
+  assert.match(htmlText, /BUILDER BOARD PREVIEW IS WORKING|<script type="module" src="\/src\/main\.tsx">/i, 'preview HTML should be served by the runtime without source rewriting');
+  assert.doesNotMatch(htmlText, /preview-runtime\//i, 'preview HTML should not be rewritten by Builder Board');
 
-  const previewRoot = await fetch(directPreviewUrl);
-  assert.equal(previewRoot.status, 200, 'preview project root should resolve on the direct runtime URL');
+  const previewRoot = await fetch(publicPreviewUrl);
+  assert.equal(previewRoot.status, 200, 'preview project root should resolve on the public forwarding route');
   const previewRootText = await previewRoot.text();
-  assert.match(previewRootText, /BUILDER BOARD PREVIEW IS WORKING|<script type="module" src="\/src\/main.tsx">/i, 'preview root should render the generated app from the runtime origin');
+  assert.match(previewRootText, /BUILDER BOARD PREVIEW IS WORKING|<script type="module" src="\/src\/main\.tsx">/i, 'preview root should render the generated app from the runtime');
 
-  const clientResponse = await fetch(new URL('/@vite/client', directPreviewUrl));
+  const clientResponse = await fetch(`${publicPreviewUrl}@vite/client`);
   assert.equal(clientResponse.status, 200, '@vite client should load');
   assert.match(clientResponse.headers.get('content-type') || '', /javascript|text\/plain/i, 'Vite client should be served as JavaScript');
 
-  const mainResponse = await fetch(new URL('/src/main.tsx', directPreviewUrl));
+  const refreshResponse = await fetch(`${publicPreviewUrl}@react-refresh`);
+  assert.equal(refreshResponse.status, 200, '@react-refresh should load');
+
+  const mainResponse = await fetch(`${publicPreviewUrl}src/main.tsx`);
   assert.equal(mainResponse.status, 200, 'main module should load');
   assert.match(mainResponse.headers.get('content-type') || '', /javascript|text\/plain/i, 'module should use JavaScript MIME type');
   const mainText = await mainResponse.text();
   assert.match(mainText, /BUILDER BOARD PREVIEW IS WORKING|ReactDOM\.createRoot/i, 'module content should include the generated app source');
+  assert.doesNotMatch(mainText, /preview-runtime\//i, 'JavaScript module source should not be rewritten');
+
+  const reactModule = await fetch(`${publicPreviewUrl}node_modules/.vite/deps/react.js`);
+  assert.equal(reactModule.status, 200, 'React dependency module should load');
+  assert.match(reactModule.headers.get('content-type') || '', /javascript|text\/plain/i, 'React dependency should be served as JavaScript');
 
   const stop = await request<{ success: boolean }>(`${SERVER_URL}/api/runtime/dev/stop/${projectId}`, { method: 'POST' });
   assert.equal(stop.success, true, 'runtime should stop successfully');
@@ -232,13 +241,14 @@ export async function verifyBuilderBoard(): Promise<string> {
   const stopped = await request<{ runtime: { state: string } | null }>(`${SERVER_URL}/api/runtime/dev/status/${projectId}`);
   assert.equal(stopped.runtime, null, 'status should be truthful after stop');
 
-  const restarted = await request<{ success: boolean; runtime?: { state: string } }>(`${SERVER_URL}/api/runtime/dev/start`, {
+  const restarted = await request<{ success: boolean; runtime?: { state: string; previewUrl?: string } }>(`${SERVER_URL}/api/runtime/dev/start`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ projectId, files }),
   });
   assert.equal(restarted.success, true, 'runtime should restart cleanly');
   assert.equal(restarted.runtime?.state, 'RUNNING', 'runtime should be RUNNING after restart');
+  assert.match(restarted.runtime?.previewUrl || '', /^\/preview-runtime\//, 'restarted runtime should keep the public preview URL');
 
   return 'Builder Board preview acceptance test passed';
 }

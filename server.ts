@@ -1,6 +1,7 @@
 import express, { Request, Response } from 'express';
 import path from 'path';
 import fs from 'fs';
+import http from 'node:http';
 import net from 'node:net';
 import vm from 'node:vm';
 import crypto from 'node:crypto';
@@ -1007,11 +1008,7 @@ interface RuntimeRecord {
 const activeRuntimeProcesses = new Map<string, RuntimeRecord>();
 
 function buildRuntimePreviewUrl(projectId: string): string {
-  const record = activeRuntimeProcesses.get(projectId);
-  if (record && record.state === 'RUNNING') {
-    return `http://127.0.0.1:${record.port}/`;
-  }
-  return `/api/runtime/preview/${encodeURIComponent(projectId)}/`;
+  return `/preview-runtime/${encodeURIComponent(projectId)}/`;
 }
 
 function createRuntimeEnvironment(port?: number): NodeJS.ProcessEnv {
@@ -1544,7 +1541,7 @@ app.post('/api/runtime/dev/start', async (req: Request, res: Response) => {
       state: 'STARTING',
       startedAt: Date.now(),
       pid: undefined,
-      previewUrl: `http://127.0.0.1:${runtimePort}/`,
+      previewUrl: buildRuntimePreviewUrl(projectId),
     };
     record.pid = record.process.pid;
     activeRuntimeProcesses.set(projectId, record);
@@ -1647,6 +1644,47 @@ app.get('/api/runtime/dev/status/:projectId', (req: Request, res: Response) => {
   });
 });
 
+app.all(['/preview-runtime/:projectId', '/preview-runtime/:projectId/*'], (req: Request, res: Response) => {
+  const { projectId } = req.params;
+  const record = activeRuntimeProcesses.get(projectId);
+  if (!record || record.state !== 'RUNNING') {
+    res.status(409).json({ success: false, error: 'Development server is not running.' });
+    return;
+  }
+
+  const suffix = req.params[0] || '';
+  const query = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '';
+  const targetPath = `${suffix ? `/${suffix}` : '/'}${query}`;
+  const headers = { ...req.headers, host: `127.0.0.1:${record.port}` };
+  delete headers.connection;
+  delete headers['content-length'];
+
+  const upstream = http.request({
+    hostname: '127.0.0.1',
+    port: record.port,
+    method: req.method,
+    path: targetPath,
+    headers,
+  }, (upstreamResponse) => {
+    res.status(upstreamResponse.statusCode || 502);
+    for (const [key, value] of Object.entries(upstreamResponse.headers)) {
+      if (value !== undefined && key !== 'connection' && key !== 'transfer-encoding') {
+        res.setHeader(key, value);
+      }
+    }
+    upstreamResponse.pipe(res);
+  });
+
+  upstream.once('error', (err) => {
+    if (!res.headersSent) {
+      res.status(502).json({ success: false, error: err.message || 'Development server is not ready.' });
+    } else {
+      res.destroy(err);
+    }
+  });
+  req.pipe(upstream);
+});
+
 app.get(['/api/runtime/preview/:projectId', '/api/runtime/preview/:projectId/*'], async (req: Request, res: Response) => {
   const { projectId } = req.params;
   const record = activeRuntimeProcesses.get(projectId);
@@ -1657,8 +1695,7 @@ app.get(['/api/runtime/preview/:projectId', '/api/runtime/preview/:projectId/*']
 
   const suffix = req.params[0] || '';
   const query = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '';
-  const target = new URL(`${suffix ? `/${suffix}` : '/'}${query}`, `http://127.0.0.1:${record.port}/`);
-  res.redirect(302, target.toString());
+  res.redirect(302, `/preview-runtime/${encodeURIComponent(projectId)}/${suffix}${query}`);
 });
 
 type PackageManager = 'npm' | 'pnpm' | 'yarn' | 'bun';

@@ -55,7 +55,7 @@ export class RuntimeService {
   }
 
   public static async checkPreview(projectId: string, signal?: AbortSignal): Promise<void> {
-    const response = await fetch(`/api/runtime/preview/${encodeURIComponent(projectId)}/`, { signal });
+    const response = await fetch(`/preview-runtime/${encodeURIComponent(projectId)}/`, { signal });
     if (!response.ok) throw new Error(`Real preview endpoint failed (${response.status}).`);
   }
 
