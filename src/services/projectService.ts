@@ -227,6 +227,7 @@ app.listen(PORT, () => {
             devDependencies: {
               '@types/express': '^4.17.21',
               '@types/node': '^22.14.0',
+              tsx: '^4.21.0',
               typescript: '^5.8.2',
               vitest: '^2.0.0',
             },

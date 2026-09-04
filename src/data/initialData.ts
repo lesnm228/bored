@@ -236,6 +236,10 @@ export class HealthChecker {
   "devDependencies": {
     "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
+    "@typescript-eslint/eslint-plugin": "^8.26.0",
+    "@typescript-eslint/parser": "^8.26.0",
+    "eslint": "^8.57.1",
+    "tsx": "^4.21.0",
     "typescript": "^5.8.2",
     "vitest": "^2.0.0"
   }

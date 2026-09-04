@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import net from 'node:net';
 import vm from 'node:vm';
+import crypto from 'node:crypto';
 import { spawn, ChildProcess, execSync } from 'node:child_process';
 import * as esbuild from 'esbuild';
 import { createServer as createViteServer } from 'vite';
@@ -485,18 +486,6 @@ function prepareWorkspaceDirectory(projectId: string, files?: Array<{ path: stri
     fs.mkdirSync(workspacePath, { recursive: true });
   }
 
-  const targetNodeModules = path.join(workspacePath, 'node_modules');
-  if (fs.existsSync(targetNodeModules)) {
-    try {
-      const stats = fs.lstatSync(targetNodeModules);
-      if (stats.isSymbolicLink() || stats.isDirectory() || stats.isFile()) {
-        fs.rmSync(targetNodeModules, { recursive: true, force: true });
-      }
-    } catch {
-      // ignore stale workspace-local install state
-    }
-  }
-
   // Sync files if provided or from store
   if (Array.isArray(files) && files.length > 0) {
     for (const file of files) {
@@ -542,6 +531,37 @@ function prepareWorkspaceDirectory(projectId: string, files?: Array<{ path: stri
     fs.writeFileSync(pkgPath, JSON.stringify(defaultPkg, null, 2), 'utf-8');
   }
 
+  try {
+    const packageJson = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    const scripts = packageJson.scripts && typeof packageJson.scripts === 'object' ? packageJson.scripts : {};
+    const devDependencies = packageJson.devDependencies && typeof packageJson.devDependencies === 'object'
+      ? { ...packageJson.devDependencies }
+      : {};
+    let changed = false;
+    if (Object.values(scripts).some((script) => typeof script === 'string' && /\btsx\b/.test(script)) && !devDependencies.tsx) {
+      devDependencies.tsx = '^4.21.0';
+      changed = true;
+    }
+    if (Object.values(scripts).some((script) => typeof script === 'string' && /\beslint\b/.test(script))) {
+      for (const [name, version] of Object.entries({ eslint: '^8.57.1', '@typescript-eslint/eslint-plugin': '^8.26.0', '@typescript-eslint/parser': '^8.26.0' })) {
+        if (!devDependencies[name]) {
+          devDependencies[name] = version;
+          changed = true;
+        }
+      }
+    }
+    if (Object.values(scripts).some((script) => typeof script === 'string' && /\bvitest\b/.test(script)) && !devDependencies.vitest) {
+      devDependencies.vitest = '^2.0.0';
+      changed = true;
+    }
+    if (changed) {
+      packageJson.devDependencies = devDependencies;
+      fs.writeFileSync(pkgPath, JSON.stringify(packageJson, null, 2), 'utf8');
+    }
+  } catch {
+    // Let the package manager report malformed manifests.
+  }
+
   // Ensure tsconfig.json in workspace if none exists
   const tsconfigPath = path.join(workspacePath, 'tsconfig.json');
   if (!fs.existsSync(tsconfigPath)) {
@@ -573,7 +593,7 @@ function broadcastTerminalEvent(sessionId: string, event: { type: 'stdout' | 'st
 }
 
 // POST /api/terminal/execute
-app.post('/api/terminal/execute', (req: Request, res: Response) => {
+app.post('/api/terminal/execute', async (req: Request, res: Response) => {
   const { projectId, command, args: customArgs, workingDirectory: subDir, files, timeoutMs } = req.body;
 
   if (!projectId || !command) {
@@ -590,6 +610,9 @@ app.post('/api/terminal/execute', (req: Request, res: Response) => {
   let workspaceRoot: string;
   try {
     workspaceRoot = prepareWorkspaceDirectory(projectId, files);
+    if (isWorkspaceValidationCommand(command)) {
+      await ensureWorkspaceDependencies(workspaceRoot);
+    }
   } catch (err: any) {
     res.status(400).json({ success: false, error: err.message || 'Invalid workspace.' });
     return;
@@ -928,7 +951,10 @@ function createRuntimeEnvironment(port?: number): NodeJS.ProcessEnv {
     TMPDIR: process.env.TMPDIR,
     NODE_ENV: 'development',
     PORT: port ? String(port) : process.env.PORT || '4173',
+    npm_config_include: 'dev',
   };
+  delete env.npm_config_production;
+  delete env.npm_config_omit;
   delete env.GITHUB_TOKEN;
   delete env.GEMINI_API_KEY;
   return env;
@@ -994,6 +1020,12 @@ async function waitForRuntimeReadiness(projectId: string, port: number, timeoutM
         return;
       }
 
+      if (response.status === 404) {
+        const healthResponse = await fetch(`http://127.0.0.1:${port}/health`, { redirect: 'manual' });
+        lastStatus = healthResponse.status;
+        if (healthResponse.ok) return;
+      }
+
       const body = await response.text();
       const previewText = body.replace(/\s+/g, ' ').slice(0, 120);
       throw new Error(`HTTP readiness check failed: ${response.status} ${response.statusText}${previewText ? ` - ${previewText}` : ''}`);
@@ -1010,11 +1042,94 @@ async function waitForRuntimeReadiness(projectId: string, port: number, timeoutM
   throw new Error(`HTTP readiness check failed after ${timeoutMs}ms (last status: ${lastStatus}).`);
 }
 
-function getRuntimeInstallCommand(manager: PackageManager): string {
-  if (manager === 'npm') return 'npm install --include=dev';
-  if (manager === 'pnpm') return 'pnpm install';
+function getRuntimeInstallCommand(manager: PackageManager, hasLockfile = false): string {
+  if (manager === 'npm') return hasLockfile ? 'npm ci --include=dev --no-audit --no-fund' : 'npm install --include=dev --no-audit --no-fund';
+  if (manager === 'pnpm') return 'pnpm install --prod=false';
   if (manager === 'yarn') return 'yarn install';
   return 'bun install';
+}
+
+function getDependencyState(workspaceRoot: string): { fingerprint: string; hasLockfile: boolean; lockfileMatchesPackage: boolean } {
+  const dependencyFiles = ['package.json', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lockb', 'bun.lock'];
+  const hash = crypto.createHash('sha256');
+  let hasLockfile = false;
+  for (const file of dependencyFiles) {
+    const filePath = path.join(workspaceRoot, file);
+    if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) continue;
+    if (file !== 'package.json') hasLockfile = true;
+    hash.update(file);
+    hash.update(fs.readFileSync(filePath));
+  }
+  let lockfileMatchesPackage = false;
+  const packagePath = path.join(workspaceRoot, 'package.json');
+  const lockPath = path.join(workspaceRoot, 'package-lock.json');
+  if (hasLockfile && fs.existsSync(packagePath) && fs.existsSync(lockPath)) {
+    try {
+      const packageJson = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
+      const lockJson = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+      const root = lockJson.packages?.[''];
+      lockfileMatchesPackage = root
+        && JSON.stringify(root.dependencies || {}) === JSON.stringify(packageJson.dependencies || {})
+        && JSON.stringify(root.devDependencies || {}) === JSON.stringify(packageJson.devDependencies || {});
+    } catch {
+      lockfileMatchesPackage = false;
+    }
+  }
+  return { fingerprint: hash.digest('hex'), hasLockfile, lockfileMatchesPackage };
+}
+
+function isWorkspaceValidationCommand(command: string): boolean {
+  return /(?:^|\s)(?:run\s+)?(?:dev|preview|lint|typecheck|test|build)(?:\s|$)/i.test(command)
+    || /(?:^|\s)(?:eslint|vitest|tsc|tsx)(?:\s|$)/i.test(command);
+}
+
+async function ensureWorkspaceDependencies(workspaceRoot: string): Promise<void> {
+  const nodeModulesPath = path.join(workspaceRoot, 'node_modules');
+  const statePath = path.join(workspaceRoot, '.builder-board-dependency-state.json');
+  const state = getDependencyState(workspaceRoot);
+  let installedState: { fingerprint?: string } = {};
+  if (fs.existsSync(statePath)) {
+    try {
+      installedState = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    } catch {
+      installedState = {};
+    }
+  }
+  if (fs.existsSync(nodeModulesPath) && installedState.fingerprint === state.fingerprint) return;
+
+  const { manager } = detectPackageManager(workspaceRoot);
+  const installCommand = getRuntimeInstallCommand(manager, state.hasLockfile && state.lockfileMatchesPackage);
+  const validation = validateCommandSandbox(installCommand);
+  if (!validation.allowed) throw new Error(`Dependency installation blocked: ${validation.reason || installCommand}`);
+
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(validation.executable, validation.args, {
+      cwd: workspaceRoot,
+      env: createRuntimeEnvironment(),
+      shell: false,
+    });
+    let output = '';
+    const timeout = setTimeout(() => {
+      child.kill('SIGTERM');
+      reject(new Error(`Dependency installation timed out after 300000ms. ${output.trim().slice(-1000)}`));
+    }, 300000);
+    child.stdout?.on('data', (chunk: Buffer) => { output += chunk.toString('utf8'); });
+    child.stderr?.on('data', (chunk: Buffer) => { output += chunk.toString('utf8'); });
+    child.once('error', (error) => {
+      clearTimeout(timeout);
+      reject(new Error(`Dependency installation failed to start in ${workspaceRoot}: ${error.message}`));
+    });
+    child.once('close', (code) => {
+      clearTimeout(timeout);
+      if (code !== 0) {
+        reject(new Error(`Dependency installation failed in ${workspaceRoot} with exit code ${code ?? 'unknown'} using "${installCommand}". ${output.trim().slice(-1000)}`));
+        return;
+      }
+      resolve();
+    });
+  });
+
+  fs.writeFileSync(statePath, JSON.stringify({ fingerprint: state.fingerprint, manager, installCommand, installedAt: Date.now() }, null, 2), 'utf8');
 }
 
 async function installRuntimeDependencies(workspaceRoot: string): Promise<void> {
@@ -1105,6 +1220,7 @@ function spawnProjectRuntime(projectId: string, workspaceRoot: string, port: num
     cwd: workspaceRoot,
     env: createRuntimeEnvironment(port),
     shell: false,
+    detached: true,
   });
 
   child.stdout?.on('data', (chunk: Buffer) => {
@@ -1137,7 +1253,7 @@ app.post('/api/runtime/prepare', (req: Request, res: Response) => {
   }
 });
 
-app.post('/api/runtime/install', (req: Request, res: Response) => {
+app.post('/api/runtime/install', async (req: Request, res: Response) => {
   const { projectId, files } = req.body as { projectId?: string; files?: Array<{ path: string; content: string }> };
   if (!projectId || typeof projectId !== 'string') {
     res.status(400).json({ success: false, error: 'projectId is required.' });
@@ -1147,7 +1263,7 @@ app.post('/api/runtime/install', (req: Request, res: Response) => {
   try {
     const workspaceRoot = prepareWorkspaceDirectory(projectId, files || []);
     const { manager } = detectPackageManager(workspaceRoot);
-    const command = getRuntimeInstallCommand(manager);
+    const command = getRuntimeInstallCommand(manager, getDependencyState(workspaceRoot).hasLockfile);
     const validation = validateCommandSandbox(command);
     if (!validation.allowed) {
       res.status(403).json({ success: false, error: validation.reason || 'Install command is blocked by the sandbox.' });
@@ -1187,6 +1303,10 @@ app.post('/api/runtime/install', (req: Request, res: Response) => {
       session.durationMs = session.finishedAt - session.startedAt;
       session.exitCode = code;
       session.events.push({ type: 'exit', text: `[INSTALL EXIT] code=${code}`, timestamp: Date.now(), exitCode: code, status: session.status });
+      if (code === 0) {
+        const state = getDependencyState(workspaceRoot);
+        fs.writeFileSync(path.join(workspaceRoot, '.builder-board-dependency-state.json'), JSON.stringify({ fingerprint: state.fingerprint, manager, command, installedAt: Date.now() }, null, 2), 'utf8');
+      }
     });
 
     child.on('error', (err) => {
@@ -1204,7 +1324,7 @@ app.post('/api/runtime/install', (req: Request, res: Response) => {
   }
 });
 
-app.post('/api/runtime/command', (req: Request, res: Response) => {
+app.post('/api/runtime/command', async (req: Request, res: Response) => {
   const { projectId, files, script } = req.body as { projectId?: string; files?: Array<{ path: string; content: string }>; script?: string };
   if (!projectId || typeof projectId !== 'string') {
     res.status(400).json({ success: false, error: 'projectId is required.' });
@@ -1217,6 +1337,7 @@ app.post('/api/runtime/command', (req: Request, res: Response) => {
 
   try {
     const workspaceRoot = prepareWorkspaceDirectory(projectId, files || []);
+    await ensureWorkspaceDependencies(workspaceRoot);
     const { manager } = detectPackageManager(workspaceRoot);
     const command = `${manager} run ${script}`;
     const validation = validateCommandSandbox(command);
@@ -1303,7 +1424,8 @@ app.post('/api/runtime/dev/start', async (req: Request, res: Response) => {
     });
 
     try {
-      child.kill('SIGTERM');
+      if (child.pid) process.kill(-child.pid, 'SIGTERM');
+      else child.kill('SIGTERM');
       await Promise.race([
         hook,
         new Promise<void>((resolve) => setTimeout(resolve, 1500)),
@@ -1313,7 +1435,8 @@ app.post('/api/runtime/dev/start', async (req: Request, res: Response) => {
     }
 
     try {
-      child.kill('SIGKILL');
+      if (child.pid) process.kill(-child.pid, 'SIGKILL');
+      else child.kill('SIGKILL');
     } catch {
       // ignore
     }
@@ -1331,14 +1454,11 @@ app.post('/api/runtime/dev/start', async (req: Request, res: Response) => {
       }
     }
 
-    const hasNodeModules = fs.existsSync(path.join(workspaceRoot, 'node_modules'));
-    if (!hasNodeModules) {
-      try {
-        await installRuntimeDependencies(workspaceRoot);
-      } catch (err: any) {
-        res.status(502).json({ success: false, error: err.message || 'Dependency installation failed before runtime start.', runtime: { projectId, state: 'FAILED', port, previewUrl: buildRuntimePreviewUrl(projectId), error: err.message || 'Dependency installation failed before runtime start.' }, readiness: 'FAIL' });
-        return;
-      }
+    try {
+      await ensureWorkspaceDependencies(workspaceRoot);
+    } catch (err: any) {
+      res.status(502).json({ success: false, error: err.message || 'Dependency installation failed before runtime start.', runtime: { projectId, state: 'FAILED', port, previewUrl: buildRuntimePreviewUrl(projectId), error: err.message || 'Dependency installation failed before runtime start.' }, readiness: 'FAIL' });
+      return;
     }
 
     const runtimePort = await reserveRuntimePort(port);
@@ -1412,10 +1532,13 @@ app.post('/api/runtime/dev/stop/:projectId', (req: Request, res: Response) => {
   }
 
   try {
-    record.process.kill('SIGTERM');
+    if (record.process.pid) process.kill(-record.process.pid, 'SIGTERM');
+    else record.process.kill('SIGTERM');
     setTimeout(() => {
       try {
-        if (!record.process.killed) {
+        if (record.process.pid) {
+          process.kill(-record.process.pid, 'SIGKILL');
+        } else if (!record.process.killed) {
           record.process.kill('SIGKILL');
         }
       } catch {
@@ -1647,7 +1770,7 @@ app.post('/api/workspace/repair', (req: Request, res: Response) => {
   }
 });
 
-app.post('/api/workspace/dev/start', (req: Request, res: Response) => {
+app.post('/api/workspace/dev/start', async (req: Request, res: Response) => {
   const { projectId, files, port = 4173 } = req.body;
   if (!projectId || !Number.isInteger(port) || port < 1024 || port > 65535) {
     res.status(400).json({ success: false, error: 'Valid projectId and port are required.' });
@@ -1661,6 +1784,7 @@ app.post('/api/workspace/dev/start', (req: Request, res: Response) => {
   let workspaceRoot: string;
   try {
     workspaceRoot = prepareWorkspaceDirectory(projectId, files);
+    await ensureWorkspaceDependencies(workspaceRoot);
   } catch (err: any) {
     res.status(400).json({ success: false, error: err.message || 'Could not prepare workspace.' });
     return;
