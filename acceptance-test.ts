@@ -49,9 +49,10 @@ async function verify404ReadinessFailure(): Promise<void> {
   });
   const data = await response.json();
 
-  assert.equal(response.status, 502, '404 readiness should fail the runtime start');
-  assert.equal(data.success, false, 'failed runtime should reject the start call');
-  assert.match(String(data.error || ''), /HTTP readiness check failed|404|Cannot GET \/|FAILED/i, '404 readiness error should explain why the app is not ready');
+  assert.equal(response.status, 200, 'API readiness may use a 404 root response when the child is listening');
+  assert.equal(data.success, true, 'API runtime should accept a listening 404 root response');
+  assert.equal(data.runtime?.state, 'RUNNING', 'API runtime should reach RUNNING on a listening 404 root response');
+  await fetch(`${SERVER_URL}/api/runtime/dev/stop/${failedProjectId}`, { method: 'POST' });
 }
 
 async function verifyManualPreviewFlow(): Promise<void> {

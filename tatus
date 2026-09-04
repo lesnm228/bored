@@ -1,0 +1,269 @@
+[1mdiff --cc server.ts[m
+[1mindex 0928c32,5d07ffb..0000000[m
+[1m--- a/server.ts[m
+[1m+++ b/server.ts[m
+[36m@@@ -1308,6 -903,224 +1308,227 @@@[m [mapp.get('/api/terminal/sessions/:projec[m
+    res.json({ success: true, count: sessions.length, sessions });[m
+  });[m
+  [m
+[32m++<<<<<<< HEAD[m
+[32m++=======[m
+[32m+ type PackageManager = 'npm' | 'pnpm' | 'yarn' | 'bun';[m
+[32m+ [m
+[32m+ function detectPackageManager(workspaceRoot: string): { manager: PackageManager; reason: string } {[m
+[32m+   const packageJsonPath = path.join(workspaceRoot, 'package.json');[m
+[32m+   if (fs.existsSync(packageJsonPath)) {[m
+[32m+     try {[m
+[32m+       const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));[m
+[32m+       const packageManager = typeof packageJson.packageManager === 'string'[m
+[32m+         ? packageJson.packageManager.split('@')[0][m
+[32m+         : '';[m
+[32m+       if (['npm', 'pnpm', 'yarn', 'bun'].includes(packageManager)) {[m
+[32m+         return { manager: packageManager as PackageManager, reason: 'package.json packageManager' };[m
+[32m+       }[m
+[32m+     } catch {[m
+[32m+       // The real install command reports malformed package.json.[m
+[32m+     }[m
+[32m+   }[m
+[32m+   const lockfiles: Array<[string, PackageManager]> = [[m
+[32m+     ['pnpm-lock.yaml', 'pnpm'],[m
+[32m+     ['yarn.lock', 'yarn'],[m
+[32m+     ['bun.lockb', 'bun'],[m
+[32m+     ['bun.lock', 'bun'],[m
+[32m+     ['package-lock.json', 'npm'],[m
+[32m+   ];[m
+[32m+   const found = lockfiles.find(([file]) => fs.existsSync(path.join(workspaceRoot, file)));[m
+[32m+   return found ? { manager: found[1], reason: found[0] } : { manager: 'npm', reason: 'default (no lockfile)' };[m
+[32m+ }[m
+[32m+ [m
+[32m+ function findRequirementGaps(files: Array<{ path: string; content: string }>, requirements: Array<{ id: string }>): string[] {[m
+[32m+   const appSource = files.filter((file) => /\.(tsx?|jsx?)$/.test(file.path)).map((file) => file.content).join('\n');[m
+[32m+   const cssSource = files.filter((file) => /\.css$/.test(file.path)).map((file) => file.content).join('\n');[m
+[32m+   const checks: Record<string, { source: string; pattern: RegExp }> = {[m
+[32m+     'entity-add': { source: appSource, pattern: /addItem|setItems\(|onSubmit=/i },[m
+[32m+     'entity-complete': { source: appSource, pattern: /toggleItem|completed|checked=/i },[m
+[32m+     'entity-delete': { source: appSource, pattern: /deleteItem|filter\(/i },[m
+[32m+     'data-persistence': { source: appSource, pattern: /localStorage\.(getItem|setItem)/i },[m
+[32m+     'responsive-ui': { source: cssSource, pattern: /@media|max-width|min-width|flex-wrap/i },[m
+[32m+     'core-deliverable': { source: appSource, pattern: /function App|export default function App/i },[m
+[32m+   };[m
+[32m+   return requirements.filter((requirement) => checks[requirement.id] && !checks[requirement.id].pattern.test(checks[requirement.id].source)).map((requirement) => requirement.id);[m
+[32m+ }[m
+[32m+ [m
+[32m+ app.post('/api/workspace/package-manager', (req: Request, res: Response) => {[m
+[32m+   const { projectId, files } = req.body;[m
+[32m+   if (!projectId) {[m
+[32m+     res.status(400).json({ success: false, error: 'Missing projectId.' });[m
+[32m+     return;[m
+[32m+   }[m
+[32m+   try {[m
+[32m+     const workspaceRoot = prepareWorkspaceDirectory(projectId, files);[m
+[32m+     const detected = detectPackageManager(workspaceRoot);[m
+[32m+     const packageJsonPath = resolveWorkspacePath(workspaceRoot, 'package.json');[m
+[32m+     const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));[m
+[32m+     res.json({[m
+[32m+       success: true,[m
+[32m+       ...detected,[m
+[32m+       scripts: packageJson.scripts && typeof packageJson.scripts === 'object' ? packageJson.scripts : {},[m
+[32m+       installCommand: `${detected.manager} install`,[m
+[32m+       workspace: `workspaces/${projectId}`,[m
+[32m+     });[m
+[32m+   } catch (err: any) {[m
+[32m+     res.status(400).json({ success: false, error: err.message || 'Could not inspect workspace.' });[m
+[32m+   }[m
+[32m+ });[m
+[32m+ [m
+[32m+ app.post('/api/workspace/verify-requirements', (req: Request, res: Response) => {[m
+[32m+   const { projectId, requirements = [] } = req.body;[m
+[32m+   if (!projectId || !Array.isArray(requirements)) {[m
+[32m+     res.status(400).json({ success: false, error: 'projectId and requirements are required.' });[m
+[32m+     return;[m
+[32m+   }[m
+[32m+   try {[m
+[32m+     const workspaceRoot = prepareWorkspaceDirectory(projectId);[m
+[32m+     const entries = fs.readdirSync(workspaceRoot, { recursive: true }) as string[];[m
+[32m+     const files = entries[m
+[32m+       .filter((file) => !file.startsWith('node_modules/') && /\.(tsx?|jsx?|css)$/.test(file))[m
+[32m+       .map((file) => ({ path: file, content: fs.readFileSync(resolveWorkspacePath(workspaceRoot, file), 'utf8') }));[m
+[32m+     const missingRequirements = findRequirementGaps(files, requirements);[m
+[32m+     res.json({ success: true, allImplemented: missingRequirements.length === 0, missingRequirements, files: files.map((file) => file.path) });[m
+[32m+   } catch (err: any) {[m
+[32m+     res.status(400).json({ success: false, error: err.message || 'Requirement verification failed.' });[m
+[32m+   }[m
+[32m+ });[m
+[32m+ [m
+[32m+ app.post('/api/workspace/repair', (req: Request, res: Response) => {[m
+[32m+   const { projectId, events = [] } = req.body;[m
+[32m+   if (!projectId || !Array.isArray(events)) {[m
+[32m+     res.status(400).json({ success: false, error: 'projectId and events are required.' });[m
+[32m+     return;[m
+[32m+   }[m
+[32m+   try {[m
+[32m+     const workspaceRoot = prepareWorkspaceDirectory(projectId);[m
+[32m+     const diagnosticText = events[m
+[32m+       .map((event: any) => (event && typeof event.text === 'string' ? event.text : ''))[m
+[32m+       .join('\n');[m
+[32m+     if (!diagnosticText) {[m
+[32m+       res.json({ success: true, repaired: false });[m
+[32m+       return;[m
+[32m+     }[m
+[32m+ [m
+[32m+     const packageJsonPath = resolveWorkspacePath(workspaceRoot, 'package.json');[m
+[32m+     if (!fs.existsSync(packageJsonPath)) {[m
+[32m+       res.json({ success: true, repaired: false });[m
+[32m+       return;[m
+[32m+     }[m
+[32m+     const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));[m
+[32m+     const entries = fs.readdirSync(workspaceRoot, { recursive: true }) as string[];[m
+[32m+     const filePaths = entries.filter((file) =>[m
+[32m+       !file.startsWith('node_modules/') &&[m
+[32m+       /\.(tsx?|jsx?|css|json|html)$/.test(file),[m
+[32m+     );[m
+[32m+     for (const relativeFile of filePaths) {[m
+[32m+       const filePath = resolveWorkspacePath(workspaceRoot, relativeFile);[m
+[32m+       if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) continue;[m
+[32m+       const content = fs.readFileSync(filePath, 'utf8');[m
+[32m+       if (content.includes('Task') && content.includes('localStorage') && relativeFile.endsWith('.tsx')) {[m
+[32m+         const repaired = content.replace([m
+[32m+           /localStorage\.getItem\(STORAGE_KEY\);/g,[m
+[32m+           "(() => { try { return localStorage.getItem(STORAGE_KEY); } catch { return null; } })();",[m
+[32m+         );[m
+[32m+         if (repaired !== content) {[m
+[32m+           fs.writeFileSync(filePath, repaired, 'utf8');[m
+[32m+           res.json({ success: true, repaired: true, file: relativeFile });[m
+[32m+           return;[m
+[32m+         }[m
+[32m+       }[m
+[32m+     }[m
+[32m+ [m
+[32m+     if ((diagnosticText.includes('Cannot find module') || diagnosticText.includes('Module not found')) && packageJson.dependencies) {[m
+[32m+       packageJson.dependencies = { ...packageJson.dependencies, react: '^18.3.1', 'react-dom': '^18.3.1' };[m
+[32m+       fs.writeFileSync(packageJsonPath, JSON.stringify(packageJson, null, 2), 'utf8');[m
+[32m+       res.json({ success: true, repaired: true, file: 'package.json' });[m
+[32m+       return;[m
+[32m+     }[m
+[32m+     res.json({ success: true, repaired: false });[m
+[32m+   } catch (err: any) {[m
+[32m+     res.status(400).json({ success: false, error: err.message || 'Repair failed.' });[m
+[32m+   }[m
+[32m+ });[m
+[32m+ [m
+[32m+ app.post('/api/workspace/dev/start', (req: Request, res: Response) => {[m
+[32m+   const { projectId, files, port = 4173 } = req.body;[m
+[32m+   if (!projectId || !Number.isInteger(port) || port < 1024 || port > 65535) {[m
+[32m+     res.status(400).json({ success: false, error: 'Valid projectId and port are required.' });[m
+[32m+     return;[m
+[32m+   }[m
+[32m+   const existing = activeDevServers.get(projectId);[m
+[32m+   if (existing) {[m
+[32m+     res.json({ success: true, status: 'running', pid: existing.process.pid, port: existing.port, startedAt: existing.startedAt, previewUrl: `/api/workspace/preview/${encodeURIComponent(projectId)}/` });[m
+[32m+     return;[m
+[32m+   }[m
+[32m+   let workspaceRoot: string;[m
+[32m+   try {[m
+[32m+     workspaceRoot = prepareWorkspaceDirectory(projectId, files);[m
+[32m+   } catch (err: any) {[m
+[32m+     res.status(400).json({ success: false, error: err.message || 'Could not prepare workspace.' });[m
+[32m+     return;[m
+[32m+   }[m
+[32m+   const { manager } = detectPackageManager(workspaceRoot);[m
+[32m+   const validation = validateCommandSandbox(`${manager} run dev`);[m
+[32m+   if (!validation.allowed) {[m
+[32m+     res.status(403).json({ success: false, error: validation.reason });[m
+[32m+     return;[m
+[32m+   }[m
+[32m+   const child = spawn(validation.executable, [...validation.args, '--', '--host', '0.0.0.0', '--port', String(port)], {[m
+[32m+     cwd: workspaceRoot,[m
+[32m+     env: { ...process.env, PATH: process.env.PATH, NODE_ENV: 'development', GITHUB_TOKEN: undefined, GEMINI_API_KEY: undefined },[m
+[32m+     shell: false,[m
+[32m+   });[m
+[32m+   const server = { process: child, port, startedAt: Date.now() };[m
+[32m+   activeDevServers.set(projectId, server);[m
+[32m+   child.stdout?.on('data', (chunk: Buffer) => console.log(`[DEV ${projectId}] ${redactTerminalSecrets(chunk.toString())}`));[m
+[32m+   child.stderr?.on('data', (chunk: Buffer) => console.warn(`[DEV ${projectId}] ${redactTerminalSecrets(chunk.toString())}`));[m
+[32m+   child.once('close', () => {[m
+[32m+     if (activeDevServers.get(projectId)?.process === child) activeDevServers.delete(projectId);[m
+[32m+   });[m
+[32m+   child.once('error', () => activeDevServers.delete(projectId));[m
+[32m+   res.json({ success: true, status: 'starting', pid: child.pid, port, previewUrl: `/api/workspace/preview/${encodeURIComponent(projectId)}/` });[m
+[32m+ });[m
+[32m+ [m
+[32m+ app.post('/api/workspace/dev/stop', (req: Request, res: Response) => {[m
+[32m+   const active = activeDevServers.get(req.body.projectId);[m
+[32m+   if (!active) {[m
+[32m+     res.json({ success: true, status: 'stopped' });[m
+[32m+     return;[m
+[32m+   }[m
+[32m+   active.process.kill('SIGTERM');[m
+[32m+   activeDevServers.delete(req.body.projectId);[m
+[32m+   res.json({ success: true, status: 'stopped', pid: active.process.pid });[m
+[32m+ });[m
+[32m+ [m
+[32m+ app.get('/api/workspace/dev/status/:projectId', (req: Request, res: Response) => {[m
+[32m+   const active = activeDevServers.get(req.params.projectId);[m
+[32m+   res.json(active[m
+[32m+     ? { success: true, status: 'running', pid: active.process.pid, port: active.port, startedAt: active.startedAt, previewUrl: `/api/workspace/preview/${encodeURIComponent(req.params.projectId)}/` }[m
+[32m+     : { success: true, status: 'stopped' });[m
+[32m+ });[m
+[32m+ [m
+[32m+ app.get('/api/workspace/preview/:projectId/*', async (req: Request, res: Response) => {[m
+[32m+   const active = activeDevServers.get(req.params.projectId);[m
+[32m+   if (!active) {[m
+[32m+     res.status(409).send('Development server is not running.');[m
+[32m+     return;[m
+[32m+   }[m
+[32m+   const suffix = req.params[0] || '';[m
+[32m+   try {[m
+[32m+     const query = req.originalUrl.includes('?') ? `?${req.originalUrl.split('?')[1]}` : '';[m
+[32m+     const upstream = await fetch(`http://127.0.0.1:${active.port}/${suffix}${query}`);[m
+[32m+     res.status(upstream.status);[m
+[32m+     upstream.headers.forEach((value, key) => {[m
+[32m+       if (!['connection', 'transfer-encoding', 'content-length'].includes(key.toLowerCase())) res.setHeader(key, value);[m
+[32m+     });[m
+[32m+     res.send(Buffer.from(await upstream.arrayBuffer()));[m
+[32m+   } catch {[m
+[32m+     res.status(502).send('Development server is not ready.');[m
+[32m+   }[m
+[32m+ });[m
+[32m+ [m
+[32m++>>>>>>> 63f77cc (Harden Builder Board runtime validation and generated app acceptance)[m
+  // Helper for GitHub headers[m
+  function getGitHubHeaders(): Record<string, string> {[m
+    const headers: Record<string, string> = {[m
+[36m@@@ -1765,22 -1582,23 +1989,35 @@@[m [mReturn your output STRICTLY as a valid [m
+      }[m
+    }[m
+  [m
+[31m-   // High-precision built-in rule planner with multi-file targets[m
+[32m+   // General fallback planner maps extracted capabilities to the primary app files.[m
+    const allPaths = files.map((f: { path: string }) => f.path);[m
+[32m++<<<<<<< HEAD[m
+[32m +  const isTaskManagerGoal = /task manager|add tasks|mark tasks completed|delete tasks|preserve tasks locally/i.test(goal);[m
+[32m++=======[m
+[32m+   const appPaths = allPaths.filter((file: string) => /(^|\/)App\.(tsx?|jsx?)$/.test(file));[m
+[32m+   const stylePaths = allPaths.filter((file: string) => /\.css$/.test(file));[m
+[32m++>>>>>>> 63f77cc (Harden Builder Board runtime validation and generated app acceptance)[m
+    const tasks = [[m
+      {[m
+        title: `Architect interface and contracts: ${goal.slice(0, 50)}`,[m
+        description: `Define interfaces, boundary contracts, and types for: ${goal}`,[m
+        priority: 'high',[m
+[32m++<<<<<<< HEAD[m
+[32m +      targetFiles: isTaskManagerGoal ? ['src/App.tsx', 'src/index.css'] : allPaths.slice(0, 2).length > 0 ? allPaths.slice(0, 2) : ['src/index.ts', 'src/services/metrics.ts'],[m
+[32m++=======[m
+[32m+       targetFiles: appPaths.length > 0 ? appPaths : (allPaths.slice(0, 1).length > 0 ? allPaths.slice(0, 1) : ['src/App.tsx']),[m
+[32m++>>>>>>> 63f77cc (Harden Builder Board runtime validation and generated app acceptance)[m
+        subtasks: ['Inspect type boundaries', 'Validate contract compatibility', 'Map cross-module imports'],[m
+      },[m
+      {[m
+        title: 'Synthesize module logic and cross-module handlers',[m
+        description: `Implement core logic, business rules, and error handlers across related project files.`,[m
+        priority: 'critical',[m
+[32m++<<<<<<< HEAD[m
+[32m +      targetFiles: isTaskManagerGoal ? ['src/main.tsx', 'package.json'] : allPaths.slice(1, 3).length > 0 ? allPaths.slice(1, 3) : ['src/services/metrics.ts', 'src/index.ts'],[m
+[32m++=======[m
+[32m+       targetFiles: [...(appPaths.length > 0 ? appPaths : ['src/App.tsx']), ...(stylePaths.length > 0 ? stylePaths : [])],[m
+[32m++>>>>>>> 63f77cc (Harden Builder Board runtime validation and generated app acceptance)[m
+        subtasks: ['Write robust function signatures', 'Implement boundary checks', 'Add structured logging'],[m
+      },[m
+      {[m

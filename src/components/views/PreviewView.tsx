@@ -4,7 +4,7 @@ import { ProjectConfig } from '../../types';
 
 interface PreviewViewProps {
   currentProject: ProjectConfig;
-  runtime: { state: string; port?: number; sessionId?: string } | null;
+  runtime: { state: string; port?: number; sessionId?: string; serviceType?: 'web' | 'api'; error?: string } | null;
   onStartRuntime: () => void;
   onStopRuntime: () => void;
 }
@@ -89,7 +89,13 @@ export const PreviewView: React.FC<PreviewViewProps> = ({ currentProject, runtim
       </div>
 
       <div className="flex-1 bg-[#030816] p-6 overflow-hidden">
-        {isRunning && !previewError ? (
+        {isRunning && runtime?.serviceType === 'api' ? (
+          <div className="w-full h-full rounded-xl border border-emerald-900/50 flex flex-col items-center justify-center gap-3 text-center px-6">
+            <Monitor className="w-10 h-10 text-emerald-400" />
+            <p className="text-sm text-slate-200 max-w-md">API/backend service running on port {runtime.port}.</p>
+            <p className="text-xs text-slate-400 max-w-md">This project does not expose a browser preview.</p>
+          </div>
+        ) : isRunning && !previewError ? (
           <div className="w-full h-full rounded-xl overflow-hidden border border-blue-900/40 bg-white">
             <iframe
               key={reloadKey}

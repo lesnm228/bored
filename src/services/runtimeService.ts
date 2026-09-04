@@ -6,6 +6,7 @@ export interface RuntimeProcess {
   pid?: number;
   port?: number;
   startedAt?: number;
+  serviceType?: 'web' | 'api';
   state: 'STARTING' | 'RUNNING' | 'FAILED' | 'STOPPED';
   error?: string;
 }
