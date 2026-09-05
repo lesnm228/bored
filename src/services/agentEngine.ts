@@ -615,38 +615,31 @@ button, input { font: inherit; }
         return { success: false, status: 'failed', message: 'Dependency installation failed.', details: { install: installResult.session } };
       }
 
-      const startRes = await fetch('/api/workspace/dev/start', {
+      // Use the same runtime pipeline (/api/runtime/dev/*, activeRuntimeProcesses,
+      // /preview-runtime/:id/*) that the manual "Start Preview" button drives. The
+      // legacy /api/workspace/dev/* + /api/workspace/preview/* pair spawns its dev
+      // server without the public "--base" path and tracks it in a separate
+      // (activeDevServers) map that the Preview panel's status polling never reads,
+      // so a server started there can never be reflected as RUNNING in the UI and
+      // is left orphaned on the same default port the manual flow also binds to.
+      // Calling the unified endpoint keeps agent- and user-started runtimes in the
+      // one map the UI actually observes, and this endpoint already blocks until
+      // HTTP readiness passes (or fails) before responding, so no separate status
+      // polling loop is needed here.
+      if (this.abortController?.signal.aborted) {
+        return { success: false, status: 'blocked', message: 'Aborted by user.' };
+      }
+      const startRes = await fetch('/api/runtime/dev/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ projectId, files: generatedFiles.map((file) => ({ path: file.path, content: file.content })), port }),
       });
       const startData = startRes.ok ? await startRes.json() : null;
-      if (!startRes.ok || !startData?.success || !startData?.pid) {
-        return { success: false, status: 'failed', message: 'Dev server could not start.', details: { start: startData } };
+      if (!startRes.ok || !startData?.success || startData?.runtime?.state !== 'RUNNING' || startData?.readiness !== 'PASS') {
+        return { success: false, status: 'failed', message: startData?.error || 'Dev server did not become ready on the expected port.', details: { port, start: startData } };
       }
 
-      const readyUrl = startData.previewUrl || `/api/workspace/preview/${encodeURIComponent(projectId)}/`;
-      let ready = false;
-      const deadline = Date.now() + 60000;
-      while (Date.now() < deadline && !ready) {
-        if (this.abortController?.signal.aborted) {
-          return { success: false, status: 'blocked', message: 'Aborted by user.' };
-        }
-        try {
-          const statusRes = await fetch(`/api/workspace/dev/status/${encodeURIComponent(projectId)}`);
-          const statusData = statusRes.ok ? await statusRes.json() : null;
-          const probe = await fetch(readyUrl, { method: 'GET' });
-          if (statusData?.status === 'running' && statusData.pid && probe.ok) {
-            ready = true;
-          }
-        } catch {
-          // retry until ready
-        }
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-      }
-      if (!ready) {
-        return { success: false, status: 'failed', message: 'Dev server did not become ready on the expected port.', details: { port, previewUrl: readyUrl } };
-      }
+      const readyUrl: string = startData.runtime.previewUrl || `/preview-runtime/${encodeURIComponent(projectId)}/`;
 
       const previewProbe = await fetch(readyUrl, { method: 'GET' });
       if (!previewProbe.ok) {
@@ -761,11 +754,7 @@ button, input { font: inherit; }
     } finally {
       if (!workflowReady) {
         try {
-          await fetch('/api/workspace/dev/stop', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ projectId }),
-          });
+          await fetch(`/api/runtime/dev/stop/${encodeURIComponent(projectId)}`, { method: 'POST' });
         } catch {
           // The server owns process cleanup; this is best effort if disconnected.
         }
