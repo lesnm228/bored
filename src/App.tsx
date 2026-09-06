@@ -230,10 +230,93 @@ export default function App() {
     appendLog(`Builder Agent triggered with goal: "${goal}"`, 'info', 'AGENT');
     setLogsOpen(true);
 
+    const sourceProject = projectOverride || currentProject;
+    const mutationRequested = /\b(build|implement|fix|add|create|update|refactor|debug|repair|deploy|integrate|optimize|write|change|modify|remove|delete)\b/i.test(goal);
+    const readOnlyRequested = /\b(inspect|check|verify|review|audit|analy[sz]e|tests?|lint|typecheck)\b/i.test(goal)
+      || /\b(without changing|do not change|don't change|read[- ]only)\b/i.test(goal);
+    const shouldRunReadOnly = readOnlyRequested && !mutationRequested;
+    const effectiveTaskId = selectedTaskId || `instruction-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const existingTask = sourceProject.tasks.find((task) => task.id === effectiveTaskId);
+    const instructionTask: TaskItem = existingTask || {
+      id: effectiveTaskId,
+      title: goal.length > 88 ? `${goal.slice(0, 85)}...` : goal,
+      description: goal,
+      status: 'received',
+      priority: 'high',
+      assignedTo: 'builder-agent',
+      targetFiles: [],
+      plannedFiles: [],
+      modifiedFiles: [],
+      canRollback: false,
+      createdAt: Date.now(),
+      logs: ['Instruction received from Chat.'],
+      subtasks: shouldRunReadOnly
+        ? [{ id: `${effectiveTaskId}-validation`, title: 'Run requested project validation', completed: false }]
+        : [],
+    };
+    let executionProject: ProjectConfig = {
+      ...sourceProject,
+      tasks: existingTask
+        ? sourceProject.tasks
+        : [instructionTask, ...sourceProject.tasks],
+      updatedAt: Date.now(),
+    };
+    handleUpdateProject(executionProject);
+    appendLog(`Task received: "${instructionTask.title}".`, 'info', 'TASKS');
+
     try {
+      if (shouldRunReadOnly) {
+        const packageFile = executionProject.files.find((file) => file.path === 'package.json');
+        let scripts: Record<string, string> = {};
+        try {
+          scripts = packageFile ? JSON.parse(packageFile.content).scripts || {} : {};
+        } catch {
+          throw new Error('package.json is invalid; no validation command was executed.');
+        }
+        const requestedScript: 'lint' | 'typecheck' | 'test' | 'build' = /\btests?\b/i.test(goal)
+          ? 'test'
+          : /\blint\b/i.test(goal)
+          ? 'lint'
+          : /\bbuild\b/i.test(goal)
+          ? 'build'
+          : scripts.typecheck
+          ? 'typecheck'
+          : scripts.lint
+          ? 'lint'
+          : scripts.test
+          ? 'test'
+          : 'build';
+        if (!scripts[requestedScript]) {
+          throw new Error(`Project does not define an npm "${requestedScript}" script.`);
+        }
+
+        const workingTask: TaskItem = { ...instructionTask, status: 'working', logs: [...(instructionTask.logs || []), `Executing npm run ${requestedScript}.`] };
+        executionProject = { ...executionProject, tasks: executionProject.tasks.map((task) => task.id === effectiveTaskId ? workingTask : task), updatedAt: Date.now() };
+        handleUpdateProject(executionProject);
+        appendLog(`Executing real project command: npm run ${requestedScript}`, 'info', 'TASKS');
+
+        const response = await RuntimeService.runScript(executionProject.id, executionProject.files, requestedScript);
+        if (!response.session) throw new Error('Runtime command did not return an execution session.');
+        const result = await RuntimeService.waitForSession(executionProject.id, response.session.id);
+        const evidence = result.events.map((event) => event.text.trim()).filter(Boolean).slice(-12);
+        const passed = result.status === 'completed' && result.exitCode === 0;
+        const finishedTask: TaskItem = {
+          ...workingTask,
+          status: passed ? 'completed' : 'failed',
+          completedAt: Date.now(),
+          validationError: passed ? undefined : `npm run ${requestedScript} exited with code ${result.exitCode ?? 'unknown'}.`,
+          logs: [...(workingTask.logs || []), ...evidence, passed ? 'Validation passed.' : 'Validation failed.'],
+          subtasks: workingTask.subtasks?.map((subtask) => ({ ...subtask, completed: passed })),
+        };
+        executionProject = { ...executionProject, tasks: executionProject.tasks.map((task) => task.id === effectiveTaskId ? finishedTask : task), updatedAt: Date.now() };
+        handleUpdateProject(executionProject);
+        appendLog(passed ? `Task completed: npm run ${requestedScript} passed.` : `Task failed: npm run ${requestedScript} exited with code ${result.exitCode ?? 'unknown'}.`, passed ? 'success' : 'error', 'TASKS');
+        return;
+      }
+
       await globalAgentEngine.runAgentSession(
         goal,
-        projectOverride || currentProject,
+        executionProject,
         autonomy,
         maxSteps,
         (updatedProj) => {
@@ -242,10 +325,19 @@ export default function App() {
         (msg, level, src) => {
           appendLog(msg, level, src);
         },
-        selectedTaskId
+        effectiveTaskId
       );
     } catch (err: any) {
-      appendLog(`Agent run failed: ${err?.message || 'Unknown error'}`, 'error', 'AGENT');
+      const message = err?.message || 'Unknown error';
+      const failedProject = {
+        ...executionProject,
+        tasks: executionProject.tasks.map((task) => task.id === effectiveTaskId
+          ? { ...task, status: 'failed' as const, completedAt: Date.now(), validationError: message, logs: [...(task.logs || []), message] }
+          : task),
+        updatedAt: Date.now(),
+      };
+      handleUpdateProject(failedProject);
+      appendLog(`Agent run failed: ${message}`, 'error', 'AGENT');
     }
   };
 

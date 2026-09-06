@@ -82,7 +82,7 @@ export const AgentWorkstationView: React.FC<AgentWorkstationViewProps> = ({
     setIsSendingChat(true);
 
     try {
-      const isBuildRequest = /\b(build|implement|fix|add|create|update|refactor|debug|repair|test|deploy|integrate|optimize)\b/i.test(userText);
+      const isBuildRequest = /\b(build|implement|fix|add|create|update|refactor|debug|repair|tests?|run|inspect|check|verify|review|audit|analy[sz]e|deploy|integrate|optimize)\b/i.test(userText);
 
       if (isBuildRequest) {
         await onExecuteAgent(userText, 'fully_autonomous', 12);
