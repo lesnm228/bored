@@ -2113,7 +2113,6 @@ app.post('/api/github/import', async (req: Request, res: Response) => {
       return;
     }
     const repoInfo = await repoRes.json();
-     await repoRes.json();
 
     // 2. Fetch recursive git tree for specified branch
     const treeRes = await fetch(`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees/${encodeURIComponent(branch)}?recursive=1`, {
