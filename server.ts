@@ -2139,7 +2139,7 @@ app.post('/api/github/import', async (req: Request, res: Response) => {
       if (ignoredPatterns.some((pattern) => item.path.includes(pattern))) return false;
       const hasAllowedExt = allowedExtensions.some((ext) => item.path.endsWith(ext)) || item.path.startsWith('.');
       return hasAllowedExt && (item.size || 0) <= 250000;
-    }).slice(0, 40);
+    });
 
     // Fetch blob contents
     const projectFiles: Array<{
