@@ -12,6 +12,7 @@
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
     "test:tasks-security": "tsx focused-tasks-security-test.ts",
+    "test:api-preview": "tsx api-preview-acceptance.ts",
     "test:acceptance": "tsx acceptance-test.ts && tsx production-preview-acceptance.ts"
   },
   "dependencies": {

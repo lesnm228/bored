@@ -51,3 +51,25 @@ const preview = await fetch(`${baseUrl}/api/runtime/preview/${projectId}/`);
 assert.equal(preview.status, 200);
 assert.match(await preview.text(), /PRODUCTION PREVIEW OK/);
 console.log('Production preview devDependency acceptance test passed');
+
+const apiProjectId = `production-api-preview-${Date.now()}`;
+const apiFiles = [
+  { path: 'package.json', content: JSON.stringify({ name: 'production-api-preview', private: true, version: '1.0.0', scripts: { dev: 'node server.cjs' } }) },
+  { path: 'server.cjs', content: "const http = require('node:http'); const server = http.createServer((req, res) => { if (req.url === '/health') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ healthy: true })); return; } res.statusCode = 404; res.end('Not found'); }); server.listen(Number(process.env.PORT));" },
+];
+
+const apiStarted = await json<{ runtime: { state: string } }>(`${baseUrl}/api/runtime/dev/start`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ projectId: apiProjectId, files: apiFiles }),
+});
+assert.equal(apiStarted.runtime.state, 'RUNNING');
+
+const apiPreview = await fetch(`${baseUrl}/preview-runtime/${apiProjectId}/`);
+assert.equal(apiPreview.status, 200);
+assert.match(await apiPreview.text(), /API runtime is running/);
+
+const apiHealth = await fetch(`${baseUrl}/preview-runtime/${apiProjectId}/health`);
+assert.equal(apiHealth.status, 200);
+assert.deepEqual(await apiHealth.json(), { healthy: true });
+console.log('Production API preview acceptance test passed');

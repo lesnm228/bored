@@ -1002,6 +1002,8 @@ interface RuntimeRecord {
   startedAt: number;
   pid?: number;
   previewUrl: string;
+  previewKind?: 'web' | 'api';
+  upstreamBasePath?: string;
   error?: string;
 }
 
@@ -1071,7 +1073,7 @@ async function reserveRuntimePort(port: number): Promise<number> {
   return port;
 }
 
-async function waitForRuntimeReadiness(projectId: string, port: number, timeoutMs = 45000, readinessPath = '/'): Promise<void> {
+async function waitForRuntimeReadiness(projectId: string, port: number, timeoutMs = 45000, readinessPath = '/'): Promise<'web' | 'api'> {
   const started = Date.now();
   let lastStatus: number | string = 'unreachable';
 
@@ -1085,13 +1087,13 @@ async function waitForRuntimeReadiness(projectId: string, port: number, timeoutM
       const response = await fetch(`http://127.0.0.1:${port}${readinessPath}`, { redirect: 'manual' });
       lastStatus = response.status;
       if (response.ok) {
-        return;
+        return 'web';
       }
 
       if (response.status === 404) {
         const healthResponse = await fetch(`http://127.0.0.1:${port}/health`, { redirect: 'manual' });
         lastStatus = healthResponse.status;
-        if (healthResponse.ok) return;
+        if (healthResponse.ok) return 'api';
       }
 
       const body = await response.text();
@@ -1564,12 +1566,14 @@ app.post('/api/runtime/dev/start', async (req: Request, res: Response) => {
 
     try {
       const runtimeBase = `/preview-runtime/${encodeURIComponent(projectId)}/`;
-      await waitForRuntimeReadiness(projectId, runtimePort, 45000, runtimeBase);
+      const previewKind = await waitForRuntimeReadiness(projectId, runtimePort, 45000, runtimeBase);
       const current = activeRuntimeProcesses.get(projectId);
       if (!current || current.process.killed) {
         throw new Error('Runtime process stopped before it became ready.');
       }
       current.state = 'RUNNING';
+      current.previewKind = previewKind;
+      current.upstreamBasePath = previewKind === 'api' ? '/' : runtimeBase;
       current.error = undefined;
       res.json({
         success: true,
@@ -1657,7 +1661,46 @@ app.all(['/preview-runtime/:projectId', '/preview-runtime/:projectId/*'], (req: 
   const suffix = req.params[0] || '';
   const query = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '';
   const runtimeBase = `/preview-runtime/${encodeURIComponent(projectId)}/`;
-  const targetPath = `${runtimeBase}${suffix}${query}`;
+  if (record.previewKind === 'api' && !suffix) {
+    const escapedProjectId = projectId.replace(/[&<>"']/g, (character) => ({
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;',
+    })[character] || character);
+    res.status(200).type('html').send(`<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>${escapedProjectId} API preview</title>
+    <style>
+      :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+      body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #020617; color: #e2e8f0; }
+      main { width: min(680px, calc(100% - 40px)); padding: 32px; border: 1px solid #1e3a8a; border-radius: 18px; background: #071022; box-shadow: 0 24px 80px #0008; }
+      .status { display: inline-flex; gap: 8px; align-items: center; color: #34d399; font-weight: 700; }
+      .dot { width: 9px; height: 9px; border-radius: 50%; background: #34d399; box-shadow: 0 0 16px #34d399; }
+      h1 { margin: 18px 0 8px; font-size: clamp(24px, 6vw, 40px); }
+      p { color: #94a3b8; line-height: 1.6; }
+      a { display: inline-block; margin-top: 16px; padding: 10px 14px; border-radius: 9px; background: #fbbf24; color: #111827; font-weight: 800; text-decoration: none; }
+      code { color: #93c5fd; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="status"><span class="dot"></span>API runtime is running</div>
+      <h1>${escapedProjectId}</h1>
+      <p>This project is a backend API and does not define a browser homepage. BuilderBoard verified its health endpoint and is forwarding API requests through the preview URL.</p>
+      <p>Verified endpoint: <code>GET /health</code></p>
+      <a href="${runtimeBase}health">Open health response</a>
+    </main>
+  </body>
+</html>`);
+    return;
+  }
+  const upstreamBasePath = record.upstreamBasePath || runtimeBase;
+  const targetPath = `${upstreamBasePath}${suffix}${query}`;
   const headers = { ...req.headers, host: `127.0.0.1:${record.port}` };
   delete headers.connection;
   delete headers['content-length'];
