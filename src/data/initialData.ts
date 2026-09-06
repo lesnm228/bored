@@ -214,6 +214,104 @@ export class HealthChecker {
 `,
       },
       {
+        id: 'f-test-health',
+        path: 'test/health.test.ts',
+        name: 'health.test.ts',
+        language: 'typescript',
+        lastModified: Date.now(),
+        content: `import { describe, expect, it } from 'vitest';
+import { HealthChecker } from '../src/services/healthChecker';
+
+describe('Health Check Suite', () => {
+  it('should return 200 and healthy status on GET /health', async () => {
+    const report = await new HealthChecker().check();
+    expect(report.healthy).toBe(true);
+    expect(report.dependencies.redis).toBe('connected');
+    expect(report.dependencies.database).toBe('connected');
+  });
+});
+`,
+      },
+      {
+        id: 'f-test-router',
+        path: 'test/router.test.ts',
+        name: 'router.test.ts',
+        language: 'typescript',
+        lastModified: Date.now(),
+        content: `import express from 'express';
+import request from 'supertest';
+import { describe, expect, it } from 'vitest';
+import { StreamRouter } from '../src/router/streamRouter';
+import { MetricsCollector } from '../src/services/metrics';
+
+const createApp = () => {
+  const app = express();
+  app.use(express.json());
+  app.use('/api/v1/stream', new StreamRouter(new MetricsCollector()).getExpressRouter());
+  return app;
+};
+
+describe('Stream Router Suite', () => {
+  it('should enqueue valid payload and return eventId on POST /publish', async () => {
+    const response = await request(createApp()).post('/api/v1/stream/publish').send({ channel: 'orders', data: { id: 1 } });
+    expect(response.status).toBe(202);
+    expect(response.body.accepted).toBe(true);
+    expect(response.body.eventId).toMatch(/^evt_/);
+  });
+
+  it('should reject request when channel or data is missing', async () => {
+    const response = await request(createApp()).post('/api/v1/stream/publish').send({ channel: 'orders' });
+    expect(response.status).toBe(400);
+    expect(response.body.error).toContain('required');
+  });
+});
+`,
+      },
+      {
+        id: 'f-test-metrics',
+        path: 'test/metrics.test.ts',
+        name: 'metrics.test.ts',
+        language: 'typescript',
+        lastModified: Date.now(),
+        content: `import { describe, expect, it } from 'vitest';
+import { MetricsCollector } from '../src/services/metrics';
+
+describe('Metrics Collector Suite', () => {
+  it('should track accurate p95 latency and ingest throughput', () => {
+    const metrics = new MetricsCollector();
+    metrics.recordStartup();
+    metrics.incrementIngestCount();
+    metrics.recordLatency(10);
+    metrics.recordLatency(20);
+    const snapshot = metrics.getSnapshot();
+    expect(snapshot.totalIngested).toBe(1);
+    expect(snapshot.avgLatencyMs).toBe(15);
+    expect(snapshot.p95LatencyMs).toBe(27);
+  });
+});
+`,
+      },
+      {
+        id: 'f-tsconfig',
+        path: 'tsconfig.json',
+        name: 'tsconfig.json',
+        language: 'json',
+        lastModified: Date.now(),
+        content: `{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "esModuleInterop": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "outDir": "dist"
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}
+`,
+      },
+      {
         id: 'f-5',
         path: 'package.json',
         name: 'package.json',
@@ -236,12 +334,14 @@ export class HealthChecker {
   "devDependencies": {
     "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
+    "@types/supertest": "^6.0.3",
     "@typescript-eslint/eslint-plugin": "^8.26.0",
     "@typescript-eslint/parser": "^8.26.0",
     "eslint": "^8.57.1",
     "tsx": "^4.21.0",
     "typescript": "^5.8.2",
-    "vitest": "^2.0.0"
+    "vitest": "^2.0.0",
+    "supertest": "^7.1.4"
   }
 }
 `,
@@ -317,42 +417,30 @@ Eagle Engine Core is an ultra-fast event router engineered for sub-millisecond d
         name: 'should return 200 and healthy status on GET /health',
         file: 'test/health.test.ts',
         suite: 'Health Check Suite',
-        status: 'passed',
-        durationMs: 14,
-        lastRun: Date.now() - 1000 * 60 * 20,
+        status: 'idle',
+        durationMs: 0,
       },
       {
         id: 'test-2',
         name: 'should enqueue valid payload and return eventId on POST /publish',
         file: 'test/router.test.ts',
         suite: 'Stream Router Suite',
-        status: 'passed',
-        durationMs: 22,
-        lastRun: Date.now() - 1000 * 60 * 20,
+        status: 'idle',
+        durationMs: 0,
       },
       {
         id: 'test-3',
         name: 'should reject request when channel or data is missing',
         file: 'test/router.test.ts',
         suite: 'Stream Router Suite',
-        status: 'passed',
-        durationMs: 18,
-        lastRun: Date.now() - 1000 * 60 * 20,
+        status: 'idle',
+        durationMs: 0,
       },
       {
         id: 'test-4',
         name: 'should track accurate p95 latency and ingest throughput',
         file: 'test/metrics.test.ts',
         suite: 'Metrics Collector Suite',
-        status: 'passed',
-        durationMs: 31,
-        lastRun: Date.now() - 1000 * 60 * 20,
-      },
-      {
-        id: 'test-5',
-        name: 'should verify RS256 token authorization headers',
-        file: 'test/auth.test.ts',
-        suite: 'Security & Auth Suite',
         status: 'idle',
         durationMs: 0,
       },
@@ -540,7 +628,7 @@ export const sampleInitialLogs: LogEntry[] = [
     timestamp: Date.now() - 1000 * 60 * 14,
     level: 'agent',
     source: 'agent',
-    message: 'Autonomous Builder Agent standing by. Project "Eagle Engine Core" loaded with 6 files, 3 tasks, and 5 tests.',
+    message: 'Autonomous Builder Agent standing by. Project "Eagle Engine Core" loaded with 10 files, 3 tasks, and 4 real tests.',
   },
   {
     id: 'log-3',

@@ -33,6 +33,10 @@ export const TestsView: React.FC<TestsViewProps> = ({
   const failedCount = currentProject.tests.filter((t) => t.status === 'failed').length;
   const totalCount = currentProject.tests.length;
   const passRate = totalCount > 0 ? Math.round((passedCount / totalCount) * 100) : 100;
+  const executedTests = currentProject.tests.filter((test) => test.lastRun && test.durationMs >= 0);
+  const averageDuration = executedTests.length > 0
+    ? Math.round(executedTests.reduce((total, test) => total + test.durationMs, 0) / executedTests.length)
+    : null;
 
   const filteredTests = currentProject.tests.filter((t) => {
     if (filter === 'passed') return t.status === 'passed';
@@ -81,19 +85,19 @@ export const TestsView: React.FC<TestsViewProps> = ({
           <div className="text-2xl font-black text-white mt-1 font-mono">
             {passedCount} <span className="text-xs text-slate-500 font-normal">/ {totalCount}</span>
           </div>
-          <p className="text-[10px] text-emerald-400 mt-2">Zero regressions reported</p>
+          <p className="text-[10px] text-emerald-400 mt-2">Based on the latest real command</p>
         </div>
 
         <div className="rounded-2xl bg-[#0a101f]/80 backdrop-blur-md border border-blue-900/50 p-5">
           <span className="text-xs text-slate-400 font-medium">Avg Execution Time</span>
-          <div className="text-2xl font-black text-amber-400 mt-1 font-mono">18ms</div>
-          <p className="text-[10px] text-slate-400 mt-2">Target &lt; 50ms (Passed)</p>
+          <div className="text-2xl font-black text-amber-400 mt-1 font-mono">{averageDuration === null ? '—' : `${averageDuration}ms`}</div>
+          <p className="text-[10px] text-slate-400 mt-2">Measured from the latest runtime session</p>
         </div>
 
         <div className="rounded-2xl bg-[#0a101f]/80 backdrop-blur-md border border-blue-900/50 p-5">
           <span className="text-xs text-slate-400 font-medium">Code Coverage</span>
-          <div className="text-2xl font-black text-blue-400 mt-1 font-mono">92.4%</div>
-          <p className="text-[10px] text-slate-400 mt-2">Branches & Functions</p>
+          <div className="text-2xl font-black text-blue-400 mt-1 font-mono">Not measured</div>
+          <p className="text-[10px] text-slate-400 mt-2">Enable a coverage reporter to collect this</p>
         </div>
       </div>
 

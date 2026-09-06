@@ -520,56 +520,46 @@ export default function App() {
     handleUpdateProject({ ...currentProject, tests: runningTests });
 
     try {
-      const res = await fetch('/api/workspace/run-tests', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          files: currentProject.files,
-          tests: currentProject.tests,
-        }),
+      const response = await RuntimeService.runScript(currentProject.id, currentProject.files, 'test');
+      if (!response.session) throw new Error('Runtime test command did not return an execution session.');
+      const result = await RuntimeService.waitForSession(currentProject.id, response.session.id);
+      const output = result.events.map((event) => event.text).join('\n');
+      result.events.forEach((event) => appendLog(event.text.trim(), event.type === 'stderr' ? 'error' : 'info', 'TEST_RUNNER'));
+      const suitePassed = result.status === 'completed' && result.exitCode === 0;
+      const finishedAt = Date.now();
+      const finalTests = currentProject.tests.map((test) => {
+        const escapedName = test.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const explicitPass = new RegExp(`(?:✓|PASS)[^\\n]*${escapedName}`, 'i').test(output);
+        const explicitFail = new RegExp(`(?:×|✕|FAIL)[^\\n]*${escapedName}`, 'i').test(output);
+        return {
+          ...test,
+          status: (suitePassed || explicitPass) && !explicitFail ? 'passed' as const : 'failed' as const,
+          durationMs: result.durationMs ? Math.max(1, Math.round(result.durationMs / Math.max(1, currentProject.tests.length))) : 0,
+          lastRun: finishedAt,
+          errorMessage: explicitFail || !suitePassed ? `Real test command exited with code ${result.exitCode ?? 'unknown'}.` : undefined,
+        };
       });
-
-      if (res.ok) {
-        const data = await res.json();
-        data.logs?.forEach((l: string) => {
-          appendLog(l, l.includes('[FAIL]') ? 'error' : l.includes('[PASS]') ? 'success' : 'info', 'TEST_RUNNER');
-        });
-
-        const finalTests = data.results || runningTests;
-        const passCount = data.passedCount ?? finalTests.filter((t: any) => t.status === 'passed').length;
-        const totalCount = finalTests.length;
-        const healthScore = totalCount > 0 ? Math.round((passCount / totalCount) * 100) : 100;
-
-        handleUpdateProject({
-          ...currentProject,
-          tests: finalTests,
-          healthScore,
-          history: [
-            {
-              id: `hist-${Date.now()}`,
-              type: 'test_run',
-              title: `Ran Test Suite (${passCount}/${totalCount} tests passed)`,
-              description: `Real in-memory sandbox execution completed in ${data.totalDurationMs || 35}ms.`,
-              timestamp: Date.now(),
-              author: 'Vitest Runner',
-            },
-            ...currentProject.history,
-          ],
-        });
-        appendLog(`✓ Vitest suite finished: ${passCount}/${totalCount} passed in ${data.totalDurationMs || 35}ms.`, 'success', 'TEST_RUNNER');
-        return;
-      }
-    } catch (err) {
-      console.warn('Real test runner API failed:', err);
+      const passCount = finalTests.filter((test) => test.status === 'passed').length;
+      const totalCount = finalTests.length;
+      handleUpdateProject({
+        ...currentProject,
+        tests: finalTests,
+        healthScore: totalCount > 0 ? Math.round((passCount / totalCount) * 100) : 0,
+        history: [{
+          id: `hist-${Date.now()}`,
+          type: 'test_run',
+          title: `Ran real test suite (${passCount}/${totalCount} passed)`,
+          description: `npm run test exited with code ${result.exitCode ?? 'unknown'} after ${result.durationMs ?? 0}ms.`,
+          timestamp: Date.now(),
+          author: 'Runtime Test Runner',
+        }, ...currentProject.history],
+      });
+      appendLog(`Real test suite finished: ${passCount}/${totalCount} passed; exit code ${result.exitCode ?? 'unknown'}.`, suitePassed ? 'success' : 'error', 'TEST_RUNNER');
+    } catch (err: any) {
+      const message = err?.message || 'Test execution failed.';
+      handleUpdateProject({ ...currentProject, tests: currentProject.tests.map((test) => ({ ...test, status: 'failed' as const, errorMessage: message, lastRun: Date.now() })) });
+      appendLog(`Real test execution failed: ${message}`, 'error', 'TEST_RUNNER');
     }
-
-    // Graceful fallback
-    const fallbackTests = currentProject.tests.map((test) => ({
-      ...test,
-      status: 'passed' as const,
-      durationMs: 14,
-    }));
-    handleUpdateProject({ ...currentProject, tests: fallbackTests });
   };
 
   const handleRunSingleTest = async (testId: string) => {
@@ -583,42 +573,8 @@ export default function App() {
     );
     handleUpdateProject({ ...currentProject, tests: runningTests });
 
-    try {
-      const res = await fetch('/api/workspace/run-tests', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          files: currentProject.files,
-          tests: [test],
-        }),
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        const singleResult = data.results?.[0];
-        if (singleResult) {
-          const updatedTests = currentProject.tests.map((t) =>
-            t.id === testId ? { ...t, status: singleResult.status, durationMs: singleResult.durationMs, lastRun: Date.now() } : t
-          );
-          handleUpdateProject({ ...currentProject, tests: updatedTests });
-          appendLog(
-            singleResult.status === 'passed'
-              ? `✓ Assertion "${test.name}" PASSED in ${singleResult.durationMs}ms.`
-              : `✕ Assertion "${test.name}" FAILED: ${singleResult.error || 'Assertion error'}`,
-            singleResult.status === 'passed' ? 'success' : 'error',
-            'TEST_RUNNER'
-          );
-          return;
-        }
-      }
-    } catch (err) {
-      console.warn('Single test execution error:', err);
-    }
-
-    const updatedTests = currentProject.tests.map((t) =>
-      t.id === testId ? { ...t, status: 'passed' as const, durationMs: 12 } : t
-    );
-    handleUpdateProject({ ...currentProject, tests: updatedTests });
+    appendLog(`Vitest runs the project suite to preserve real imports and setup for "${test.name}".`, 'info', 'TEST_RUNNER');
+    await handleRunAllTests();
   };
 
   // Deployments
