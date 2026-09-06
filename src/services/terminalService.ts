@@ -52,7 +52,13 @@ export class TerminalService {
           try {
             const eventPayload = JSON.parse(e.data);
             if (eventPayload.type === 'init') {
-              // initial state
+              if (eventPayload.session) {
+                Object.assign(session, eventPayload.session);
+                if (['completed', 'failed', 'cancelled'].includes(session.status)) {
+                  onFinished?.(session);
+                  sse.close();
+                }
+              }
             } else {
               const termEvent: TerminalEvent = {
                 type: eventPayload.type,
@@ -106,37 +112,48 @@ export class TerminalService {
   ): Promise<{ session: TerminalSession; cancel: () => Promise<boolean> }> {
     return new Promise(async (resolve, reject) => {
       let settled = false;
+      let pollTimer: ReturnType<typeof setTimeout> | undefined;
+      let cancelExecution: (() => Promise<boolean>) | undefined;
+      let earlyFinishedSession: TerminalSession | undefined;
+      const settle = (result: { session: TerminalSession; cancel: () => Promise<boolean> }) => {
+        if (settled) return;
+        settled = true;
+        if (pollTimer) clearTimeout(pollTimer);
+        resolve(result);
+      };
       try {
         const result = await this.executeCommand({
           ...options,
           onFinished: (session) => {
             options.onFinished?.(session);
-            if (!settled) {
-              settled = true;
-              resolve({ session, cancel: result.cancel });
-            }
+            if (cancelExecution) settle({ session, cancel: cancelExecution });
+            else earlyFinishedSession = session;
           },
         });
+        cancelExecution = result.cancel;
+        if (earlyFinishedSession) {
+          settle({ session: earlyFinishedSession, cancel: result.cancel });
+          return;
+        }
         if (['completed', 'failed', 'cancelled'].includes(result.session.status)) {
-          settled = true;
-          resolve(result);
-        } else if (typeof EventSource === 'undefined') {
+          settle(result);
+        } else {
           const poll = async () => {
             if (settled) return;
             const sessions = await this.fetchSessions(options.projectId);
             const current = sessions.find((session) => session.id === result.session.id);
             if (current && ['completed', 'failed', 'cancelled'].includes(current.status)) {
-              settled = true;
-              resolve({ session: current, cancel: result.cancel });
+              settle({ session: current, cancel: result.cancel });
               return;
             }
-            setTimeout(poll, 250);
+            pollTimer = setTimeout(() => { void poll(); }, 250);
           };
           void poll();
         }
       } catch (error) {
         if (!settled) {
           settled = true;
+          if (pollTimer) clearTimeout(pollTimer);
           reject(error);
         }
       }

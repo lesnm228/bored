@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { TaskItem } from './src/types';
 import { taskStatusAfterPipeline, updateAuthoritativeTask } from './src/services/taskExecutionPolicy';
+import { TerminalService } from './src/services/terminalService';
 import { resolveWorkspacePath } from './src/services/workspacePathSecurity';
 
 const task: TaskItem = {
@@ -41,9 +42,59 @@ function testPathContainment(): void {
   fs.rmSync(outside, { recursive: true, force: true });
 }
 
+async function testTerminalCompletionFromInitialSseSnapshot(): Promise<void> {
+  const originalFetch = globalThis.fetch;
+  const originalEventSource = (globalThis as typeof globalThis & { EventSource?: unknown }).EventSource;
+  const projectId = 'sse-race-regression';
+  let finishedCallbackCalled = false;
+  const session = {
+    id: 'exec-race',
+    projectId,
+    command: 'npm run test',
+    workingDirectory: '.',
+    status: 'running' as const,
+    startedAt: Date.now(),
+    events: [],
+  };
+  const completedSession = { ...session, status: 'completed' as const, exitCode: 0, finishedAt: Date.now(), durationMs: 2 };
+
+  globalThis.fetch = (async (input: URL | RequestInfo) => {
+    if (String(input).includes('/api/terminal/execute')) {
+      return new Response(JSON.stringify({ success: true, sessionId: session.id, session }), { status: 200 });
+    }
+    throw new Error(`Unexpected fetch: ${String(input)}`);
+  }) as typeof fetch;
+  class CompletedBeforeSseEventSource {
+    onmessage: ((event: MessageEvent<string>) => void) | null = null;
+    onerror: (() => void) | null = null;
+    constructor() {
+      queueMicrotask(() => this.onmessage?.({
+        data: JSON.stringify({ type: 'init', session: completedSession }),
+      } as MessageEvent<string>));
+    }
+    close(): void {}
+  }
+  (globalThis as typeof globalThis & { EventSource?: unknown }).EventSource = CompletedBeforeSseEventSource as unknown as typeof EventSource;
+
+  try {
+    const result = await Promise.race([
+      TerminalService.executeAndWait({ projectId, command: 'npm run test', onFinished: () => { finishedCallbackCalled = true; } }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Terminal completion promise hung on completed SSE init.')), 1000)),
+    ]);
+    assert.equal(result.session.status, 'completed', 'completed SSE init snapshot must settle executeAndWait');
+    assert.equal(result.session.exitCode, 0, 'completed SSE init snapshot must preserve exit code');
+    assert.equal(finishedCallbackCalled, true, 'completed SSE init snapshot must invoke completion callback');
+  } finally {
+    globalThis.fetch = originalFetch;
+    (globalThis as typeof globalThis & { EventSource?: unknown }).EventSource = originalEventSource;
+  }
+}
+
 testTaskIdLinkage();
 testTruthfulCompletion();
 testPathContainment();
+await testTerminalCompletionFromInitialSseSnapshot();
 console.log('focused task ID linkage tests passed');
 console.log('focused truthful completion tests passed');
 console.log('focused workspace path containment tests passed');
+console.log('focused terminal SSE completion race test passed');
